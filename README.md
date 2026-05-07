@@ -15,7 +15,7 @@ pip install pygxml
 ```python
 import pygxml
 
-xml = b"""<store>
+xml = """<store>
   <book id="b1"><title>XML in a Nutshell</title><price>30</price></book>
   <book id="b2"><title>The Cathedral and the Bazaar</title><price>20</price></book>
   <book id="b3"><title>Programming Rust</title><price>45</price></book>
@@ -101,7 +101,7 @@ pygxml.validate(xml)                                        # True
 |--------------------------|-----------------------------------------------------------|
 | `r.exists()`             | `True` if the value was found in the XML                 |
 | `r.to_str()`             | String representation (text content for elements, or full XML for dict/list elements)             |
-| `r.to_int()` / `r.to_float()` | Typed coercions; return `0` / `0.0` when empty |
+| `r.to_int()`,`r.to_float()` | Typed coercions; return `0` / `0.0` when empty |
 | `r.to_bool()` | gjson-style boolean coercion (see below); returns `False` when empty |
 | `r.get(path)`            | Sub-query relative to this value                          |
 | `r.get_many(paths)`      | Sub-query at multiple paths; returns `list[Result]`       |
