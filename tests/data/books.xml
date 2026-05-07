@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<store>
+  <book id="b1" lang="en">
+    <title>XML in a Nutshell</title>
+    <author>Elliotte Rusty Harold</author>
+    <price>30</price>
+  </book>
+  <book id="b2" lang="en">
+    <title>The Cathedral and the Bazaar</title>
+    <author>Eric S. Raymond</author>
+    <price>20</price>
+  </book>
+  <book id="b3" lang="en">
+    <title>Programming Rust</title>
+    <author>Jim Blandy</author>
+    <price>45</price>
+  </book>
+  <magazine id="m1">
+    <title>Linux Journal</title>
+  </magazine>
+</store>

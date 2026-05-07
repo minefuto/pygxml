@@ -1,0 +1,28 @@
+[package]
+name = "pygxml"
+version = "0.0.1"
+edition = "2021"
+description = "streaming parser using gjson-style path queries over XML"
+license = "MIT"
+
+[lib]
+name = "pygxml"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# abi3-py311 is required for `pyo3::buffer::PyBuffer` (mmap zero-copy support).
+# Earlier abi3 levels gate the buffer protocol module out of the stable ABI.
+pyo3 = { version = "0.28", features = ["abi3-py311", "generate-import-lib"] }
+quick-xml = { version = "0.37", features = ["encoding"] }
+memchr = "2"
+smallvec = "1"
+
+[features]
+# Enabled by maturin during the wheel build; suppresses libpython link.
+# Disabled for `cargo test` so test binaries can link against the host Python.
+extension-module = ["pyo3/extension-module"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3

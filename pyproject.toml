@@ -1,0 +1,36 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "pygxml"
+version = "0.0.1"
+description = "streaming parser using gjson-style path queries over XML"
+requires-python = ">=3.11"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "minefuto" }]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+
+[tool.uv]
+cache-keys = [{ file = "pyproject.toml" }, { file = "src/**/*.rs" }, { file = "Cargo.toml" }, { file = "Cargo.lock" }]
+
+[tool.maturin]
+features = ["extension-module"]
+python-source = "python"
+module-name = "pygxml._pygxml"
+
+[dependency-groups]
+dev = [
+    "lxml>=6.1.0",
+    "maturin>=1.13.1",
+    "pytest>=9.0.3",
+]
