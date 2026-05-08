@@ -103,6 +103,13 @@ fn compile_path(path: &str) -> PyResult<Arc<Program>> {
         .map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
+fn compile_path_opt(path: &str) -> PyResult<Option<Arc<Program>>> {
+    if path.is_empty() {
+        return Ok(None);
+    }
+    compile_path(path).map(Some)
+}
+
 /// The bytes backing an `Item::Element`.
 enum Source {
     /// Bytes captured from a previous engine run — small and self-contained.
@@ -558,6 +565,9 @@ impl PyResult_ {
                  iterate the Result or pick an index first",
             ));
         }
+        if path.is_empty() {
+            return Py::new(py, PyResult_::new(Vec::new()));
+        }
         let prog = compile_path(path)?;
         let mut out: Vec<PyItem> = Vec::new();
         for it in &self.items {
@@ -595,12 +605,12 @@ impl PyResult_ {
             ));
         }
 
-        let mut programs: Vec<Arc<Program>> = Vec::with_capacity(paths.len());
+        let mut programs: Vec<Option<Arc<Program>>> = Vec::with_capacity(paths.len());
         for item in paths.iter() {
             if let Ok(s) = item.extract::<&str>() {
-                programs.push(compile_path(s)?);
+                programs.push(compile_path_opt(s)?);
             } else if let Ok(p) = item.extract::<PyRef<PyPath>>() {
-                programs.push(Arc::clone(&p.program));
+                programs.push(Some(Arc::clone(&p.program)));
             } else {
                 return Err(PyTypeError::new_err(
                     "paths must be a list of str or pygxml.Path",
@@ -612,20 +622,32 @@ impl PyResult_ {
         if programs.is_empty() {
             return Ok(list.into());
         }
-        let prog_refs: Vec<&path::Program> = programs.iter().map(|a| a.as_ref()).collect();
+
+        let active: Vec<&Arc<Program>> = programs.iter().filter_map(|o| o.as_ref()).collect();
 
         for it in &self.items {
             if let PyItem::Element(src) = it {
-                let results = match src {
-                    Source::Borrowed(_) | Source::BorrowedSlice { .. } => it
-                        .with_bytes(py, |bytes| run_many(&prog_refs, bytes, false))?
-                        .map_err(engine_err_to_py)?,
-                    Source::Owned(_) => it
-                        .with_bytes(py, |bytes| run_many_within(&prog_refs, bytes))?
-                        .map_err(engine_err_to_py)?,
+                let mut engine_results = if active.is_empty() {
+                    vec![]
+                } else {
+                    let prog_refs: Vec<&path::Program> =
+                        active.iter().map(|p| p.as_ref()).collect();
+                    match src {
+                        Source::Borrowed(_) | Source::BorrowedSlice { .. } => it
+                            .with_bytes(py, |bytes| run_many(&prog_refs, bytes, false))?
+                            .map_err(engine_err_to_py)?,
+                        Source::Owned(_) => it
+                            .with_bytes(py, |bytes| run_many_within(&prog_refs, bytes))?
+                            .map_err(engine_err_to_py)?,
+                    }
                 };
-                for items in results {
-                    let r = Py::new(py, PyResult_::new(lift(items)))?;
+                let mut engine_iter = engine_results.drain(..);
+                for opt in &programs {
+                    let r = if opt.is_some() {
+                        Py::new(py, PyResult_::new(lift(engine_iter.next().unwrap())))?
+                    } else {
+                        Py::new(py, PyResult_::new(Vec::new()))?
+                    };
                     list.append(r)?;
                 }
                 return Ok(list.into());
@@ -1307,6 +1329,9 @@ impl PyPath {
 #[pyfunction]
 #[pyo3(name = "get")]
 fn py_get(py: Python<'_>, data: &Bound<'_, PyString>, path: &str) -> PyResult<Py<PyResult_>> {
+    if path.is_empty() {
+        return Py::new(py, PyResult_::new(Vec::new()));
+    }
     let prog = compile_path(path)?;
     let owned: String = data.extract()?;
     let items = engine::run(&prog, owned.as_bytes()).map_err(engine_err_to_py)?;
@@ -1316,6 +1341,9 @@ fn py_get(py: Python<'_>, data: &Bound<'_, PyString>, path: &str) -> PyResult<Py
 #[pyfunction]
 #[pyo3(name = "get_bytes")]
 fn py_get_bytes(py: Python<'_>, data: &Bound<'_, PyBytes>, path: &str) -> PyResult<Py<PyResult_>> {
+    if path.is_empty() {
+        return Py::new(py, PyResult_::new(Vec::new()));
+    }
     let prog = compile_path(path)?;
     let items = engine::run(&prog, data.as_bytes()).map_err(engine_err_to_py)?;
     Py::new(py, PyResult_::new(lift(items)))
@@ -1324,6 +1352,9 @@ fn py_get_bytes(py: Python<'_>, data: &Bound<'_, PyBytes>, path: &str) -> PyResu
 #[pyfunction]
 #[pyo3(name = "get_buffer")]
 fn py_get_buffer(py: Python<'_>, data: &Bound<'_, PyAny>, path: &str) -> PyResult<Py<PyResult_>> {
+    if path.is_empty() {
+        return Py::new(py, PyResult_::new(Vec::new()));
+    }
     let prog = compile_path(path)?;
     let items = with_buffer_input(data, |bytes| engine::run(&prog, bytes))?
         .map_err(engine_err_to_py)?;
@@ -1347,13 +1378,13 @@ fn py_validate(data: &Bound<'_, PyAny>) -> PyResult<bool> {
     with_xml_input(data, validate)
 }
 
-fn collect_programs(paths: &Bound<'_, PyList>) -> PyResult<Vec<Arc<Program>>> {
-    let mut programs: Vec<Arc<Program>> = Vec::with_capacity(paths.len());
+fn collect_programs(paths: &Bound<'_, PyList>) -> PyResult<Vec<Option<Arc<Program>>>> {
+    let mut programs: Vec<Option<Arc<Program>>> = Vec::with_capacity(paths.len());
     for item in paths.iter() {
         if let Ok(s) = item.extract::<&str>() {
-            programs.push(compile_path(s)?);
+            programs.push(compile_path_opt(s)?);
         } else if let Ok(p) = item.extract::<PyRef<PyPath>>() {
-            programs.push(Arc::clone(&p.program));
+            programs.push(Some(Arc::clone(&p.program)));
         } else {
             return Err(PyTypeError::new_err(
                 "paths must be a list of str or pygxml.Path",
@@ -1375,11 +1406,22 @@ fn py_get_many(
     if programs.is_empty() {
         return Ok(list.into());
     }
-    let prog_refs: Vec<&path::Program> = programs.iter().map(|a| a.as_ref()).collect();
-    let owned: String = data.extract()?;
-    let results = run_many(&prog_refs, owned.as_bytes(), false).map_err(engine_err_to_py)?;
-    for items in results {
-        list.append(Py::new(py, PyResult_::new(lift(items)))?)?;
+    let active: Vec<&Arc<Program>> = programs.iter().filter_map(|o| o.as_ref()).collect();
+    let mut engine_results = if active.is_empty() {
+        vec![]
+    } else {
+        let prog_refs: Vec<&path::Program> = active.iter().map(|p| p.as_ref()).collect();
+        let owned: String = data.extract()?;
+        run_many(&prog_refs, owned.as_bytes(), false).map_err(engine_err_to_py)?
+    };
+    let mut engine_iter = engine_results.drain(..);
+    for opt in &programs {
+        let r = if opt.is_some() {
+            Py::new(py, PyResult_::new(lift(engine_iter.next().unwrap())))?
+        } else {
+            Py::new(py, PyResult_::new(Vec::new()))?
+        };
+        list.append(r)?;
     }
     Ok(list.into())
 }
@@ -1396,12 +1438,23 @@ fn py_get_many_bytes(
     if programs.is_empty() {
         return Ok(list.into());
     }
-    let prog_refs: Vec<&path::Program> = programs.iter().map(|a| a.as_ref()).collect();
+    let active: Vec<&Arc<Program>> = programs.iter().filter_map(|o| o.as_ref()).collect();
     // PyBytes is immutable — always use zero-copy ElementRef.
     let source: Py<PyAny> = data.clone().into_any().unbind();
-    let results = run_many(&prog_refs, data.as_bytes(), true).map_err(engine_err_to_py)?;
-    for items in results {
-        list.append(Py::new(py, PyResult_::new(lift_with_source(items, &source, py)))?)?;
+    let mut engine_results = if active.is_empty() {
+        vec![]
+    } else {
+        let prog_refs: Vec<&path::Program> = active.iter().map(|p| p.as_ref()).collect();
+        run_many(&prog_refs, data.as_bytes(), true).map_err(engine_err_to_py)?
+    };
+    let mut engine_iter = engine_results.drain(..);
+    for opt in &programs {
+        let r = if opt.is_some() {
+            Py::new(py, PyResult_::new(lift_with_source(engine_iter.next().unwrap(), &source, py)))?
+        } else {
+            Py::new(py, PyResult_::new(Vec::new()))?
+        };
+        list.append(r)?;
     }
     Ok(list.into())
 }
@@ -1418,12 +1471,23 @@ fn py_get_many_buffer(
     if programs.is_empty() {
         return Ok(list.into());
     }
-    let prog_refs: Vec<&path::Program> = programs.iter().map(|a| a.as_ref()).collect();
+    let active: Vec<&Arc<Program>> = programs.iter().filter_map(|o| o.as_ref()).collect();
     // Buffer inputs (mmap, bytearray) may be mutable — cannot use zero-copy ElementRef.
-    let results = with_buffer_input(data, |bytes| run_many(&prog_refs, bytes, false))?
-        .map_err(engine_err_to_py)?;
-    for items in results {
-        list.append(Py::new(py, PyResult_::new(lift(items)))?)?;
+    let mut engine_results = if active.is_empty() {
+        vec![]
+    } else {
+        let prog_refs: Vec<&path::Program> = active.iter().map(|p| p.as_ref()).collect();
+        with_buffer_input(data, |bytes| run_many(&prog_refs, bytes, false))?
+            .map_err(engine_err_to_py)?
+    };
+    let mut engine_iter = engine_results.drain(..);
+    for opt in &programs {
+        let r = if opt.is_some() {
+            Py::new(py, PyResult_::new(lift(engine_iter.next().unwrap())))?
+        } else {
+            Py::new(py, PyResult_::new(Vec::new()))?
+        };
+        list.append(r)?;
     }
     Ok(list.into())
 }

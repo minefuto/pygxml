@@ -136,3 +136,62 @@ def test_result_get_via_iteration_works():
         "The Cathedral and the Bazaar",
         "Programming Rust",
     ]
+
+
+# ---- empty path returns empty Result, not ValueError -------------------------
+
+_SIMPLE = b"<root><a>1</a></root>"
+
+
+def test_get_empty_path():
+    assert not pygxml.get(_SIMPLE.decode(), "").exists()
+
+
+def test_get_bytes_empty_path():
+    assert not pygxml.get_bytes(_SIMPLE, "").exists()
+
+
+def test_get_buffer_empty_path():
+    assert not pygxml.get_buffer(bytearray(_SIMPLE), "").exists()
+
+
+def test_get_many_empty_path_mixed():
+    rs = pygxml.get_many(_SIMPLE.decode(), ["root.a", ""])
+    assert str(rs[0]) == "1"
+    assert not rs[1].exists()
+
+
+def test_get_many_bytes_empty_path_mixed():
+    rs = pygxml.get_many_bytes(_SIMPLE, ["root.a", ""])
+    assert str(rs[0]) == "1"
+    assert not rs[1].exists()
+
+
+def test_get_many_buffer_empty_path_mixed():
+    rs = pygxml.get_many_buffer(bytearray(_SIMPLE), ["root.a", ""])
+    assert str(rs[0]) == "1"
+    assert not rs[1].exists()
+
+
+def test_get_many_all_empty_paths():
+    rs = pygxml.get_many_bytes(_SIMPLE, ["", ""])
+    assert len(rs) == 2 and not rs[0].exists() and not rs[1].exists()
+
+
+def test_get_many_empty_path_first():
+    rs = pygxml.get_many_bytes(_SIMPLE, ["", "root.a"])
+    assert not rs[0].exists()
+    assert str(rs[1]) == "1"
+
+
+def test_result_get_empty_path():
+    book = pygxml.get_bytes(BOOKS, "store.book.0")
+    assert not book.get("").exists()
+
+
+def test_result_get_many_empty_path():
+    book = pygxml.get_bytes(BOOKS, "store.book.0")
+    rs = book.get_many(["title", "", "@id"])
+    assert str(rs[0]) == "XML in a Nutshell"
+    assert not rs[1].exists()
+    assert str(rs[2]) == "b1"
