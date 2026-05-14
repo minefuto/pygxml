@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "pygxml"
-version = "0.0.2"
+version = "0.0.3"
 description = "streaming parser using gjson-style path queries over XML"
 requires-python = ">=3.11"
 readme = "README.md"
