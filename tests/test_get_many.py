@@ -1,4 +1,4 @@
-"""Tests for pygxml.get_many_bytes() and related multi-path queries."""
+"""Tests for get_many, get_many_bytes, get_many_buffer, and Result.get_many."""
 from pathlib import Path
 
 import pytest

@@ -1,6 +1,11 @@
 // Streaming evaluator. Drives a `quick_xml::Reader` over the input bytes,
 // matching the program's Step list and emitting results without ever building
-// a DOM. Subtrees that cannot match are skipped via `read_to_end_into`.
+// a DOM. Both the single-program path (`run`/`enter`) and the multi-program
+// path (`run_many`/`scan_many_children`) use `Reader<&[u8]>` slice mode:
+// `reader.read_event()` and `reader.read_to_end()` borrow directly from the
+// input slice with no per-event copy into a temporary buffer.
+//
+// Subtrees that cannot match are skipped via `read_to_end`.
 //
 // Element-terminal matches (`a.b.0`) capture the matched element's full
 // `<e ...>...</e>` byte fragment as `Item::Element`, so the caller can re-run
@@ -69,8 +74,8 @@ pub fn run(program: &Program, xml: &[u8]) -> Result<Vec<Item>, EngineError> {
         let mut reader = Reader::from_reader(xml);
         reader.config_mut().trim_text(false);
         reader.config_mut().expand_empty_elements = false;
-        let mut buf: Vec<u8> = Vec::new();
-        match enter(&mut reader, xml, &mut buf, None, &program.steps, &mut out) {
+        reader.config_mut().check_end_names = false;
+        match enter(&mut reader, xml, None, &program.steps, &mut out) {
             Ok(()) | Err(EngineError::Done) => {}
             Err(e) => return Err(e),
         }
@@ -81,7 +86,7 @@ pub fn run(program: &Program, xml: &[u8]) -> Result<Vec<Item>, EngineError> {
 
 /// Returns true iff `xml` is a well-formed XML document with exactly one root
 /// element, all start/end tags balanced, and no parser errors. Single forward
-/// pass; one reusable buffer; no allocation per event. Mirrors gjson's Valid().
+/// pass; no allocation per event. Mirrors gjson's Valid().
 pub fn validate(xml: &[u8]) -> bool {
     let mut reader = Reader::from_reader(xml);
     let cfg = reader.config_mut();
@@ -89,12 +94,10 @@ pub fn validate(xml: &[u8]) -> bool {
     cfg.expand_empty_elements = false;
     cfg.check_end_names = true; // default in quick-xml; set explicitly for safety
 
-    let mut buf: Vec<u8> = Vec::new();
     let mut depth: i32 = 0;
     let mut roots: u32 = 0;
     loop {
-        buf.clear();
-        match reader.read_event_into(&mut buf) {
+        match reader.read_event() {
             Ok(Event::Start(_)) => {
                 if depth == 0 {
                     roots += 1;
@@ -142,8 +145,7 @@ pub fn run_within(program: &Program, fragment: &[u8]) -> Result<Vec<Item>, Engin
 }
 
 /// Extract the textual representation of an item — text content for elements,
-/// the raw bytes for scalars. Used by `Result.str()`/`.list()` and by modifiers
-/// that need to coerce items to strings/numbers.
+/// the raw bytes for scalars. Used by the `Unique` modifier and in tests.
 pub fn item_text(item: &Item) -> Vec<u8> {
     match item {
         Item::Scalar(v) | Item::Text(v) => v.clone(),
@@ -170,11 +172,10 @@ pub fn extract_element_text(fragment: &[u8]) -> Vec<u8> {
     let mut reader = Reader::from_reader(fragment);
     reader.config_mut().trim_text(false);
     reader.config_mut().expand_empty_elements = false;
-    let mut buf: Vec<u8> = Vec::new();
+    reader.config_mut().check_end_names = false;
     loop {
-        buf.clear();
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(_)) => return read_text_in_scope(&mut reader, &mut buf),
+        match reader.read_event() {
+            Ok(Event::Start(_)) => return read_text_in_scope(&mut reader),
             Ok(Event::Empty(_)) => return Vec::new(),
             Ok(Event::Eof) => return Vec::new(),
             _ => continue,
@@ -266,7 +267,6 @@ fn parse_item_number(it: &Item) -> Option<f64> {
 fn enter<'i>(
     reader: &mut Reader<&'i [u8]>,
     input: &'i [u8],
-    buf: &mut Vec<u8>,
     current: Option<&BytesStart<'_>>,
     steps: &[Step],
     out: &mut Vec<Item>,
@@ -277,13 +277,13 @@ fn enter<'i>(
                 out.push(Item::Scalar(val));
             }
         }
-        consume_to_end(reader, buf, current.is_some());
+        consume_to_end(reader, current.is_some());
         return Ok(());
     }
 
     if matches!(steps.first(), Some(Step::Text)) {
         if current.is_some() {
-            out.push(Item::Scalar(read_text_in_scope(reader, buf)));
+            out.push(Item::Scalar(read_text_in_scope(reader)));
         } else {
             out.push(Item::Scalar(Vec::new()));
         }
@@ -318,20 +318,14 @@ fn enter<'i>(
 
     loop {
         let pos_before = reader.buffer_position() as usize;
-        buf.clear();
-        match reader.read_event_into(buf) {
+        match reader.read_event() {
             Ok(Event::Start(child)) => {
-                // A1: borrow name bytes from buf; avoid a separate to_vec().
-                // into_owned() is called conditionally below (match/descendant paths only).
-                let qn = child.name();
-                let qn_raw = qn.into_inner();
+                // qn_raw borrows from `input` (slice-backed reader: no copy).
+                let qn_raw = child.name().into_inner();
                 let local_raw = local_name_bytes(qn_raw);
                 if name.matches_bytes(qn_raw, local_raw) {
                     count += 1;
-                    // A1: single allocation; copy just the name bytes (SmallVec
-                    // avoids heap for short names) so `owned` can be moved.
                     let owned = child.into_owned();
-                    let qn_stack: SmallVec<[u8; 64]> = SmallVec::from_slice(owned.name().into_inner());
                     if auto_check {
                         if auto_matched {
                             return Err(EngineError::AmbiguousMatch {
@@ -339,16 +333,12 @@ fn enter<'i>(
                             });
                         }
                         auto_matched = true;
-                        descend_or_capture(
-                            reader, input, buf, &owned, &qn_stack, rest, out, pos_before,
-                        )?;
+                        descend_or_capture(reader, input, &owned, rest, out, pos_before)?;
                     } else {
                         if let Some(emitted) = handle_match_start(
                             reader,
                             input,
-                            buf,
                             owned,
-                            &qn_stack,
                             &index,
                             count,
                             rest,
@@ -366,17 +356,15 @@ fn enter<'i>(
                     // the search continues at deeper levels. Descendant target
                     // is always `Each` — never short-circuits, never errors.
                     let owned = child.into_owned();
-                    enter(reader, input, buf, Some(&owned), steps, out)?;
+                    enter(reader, input, Some(&owned), steps, out)?;
                 } else {
-                    // Skip: copy just the qname bytes for read_to_end_into
-                    // (qn_raw borrows buf which read_to_end_into needs mutably).
-                    let qn_skip: SmallVec<[u8; 64]> = SmallVec::from_slice(qn_raw);
-                    let _ = reader.read_to_end_into(quick_xml::name::QName(&qn_skip), buf);
+                    // qn_raw borrows from input (not from a temporary buf),
+                    // so it can be passed directly to read_to_end.
+                    let _ = reader.read_to_end(quick_xml::name::QName(qn_raw));
                 }
             }
             Ok(Event::Empty(child)) => {
-                let qn = child.name();
-                let qn_raw = qn.into_inner();
+                let qn_raw = child.name().into_inner();
                 let local_raw = local_name_bytes(qn_raw);
                 if name.matches_bytes(qn_raw, local_raw) {
                     count += 1;
@@ -416,21 +404,20 @@ fn enter<'i>(
 fn descend_or_capture<'i>(
     reader: &mut Reader<&'i [u8]>,
     input: &'i [u8],
-    buf: &mut Vec<u8>,
     child: &BytesStart<'_>,
-    qn_bytes: &[u8],
     rest: &[Step],
     out: &mut Vec<Item>,
     pos_before: usize,
 ) -> Result<bool, EngineError> {
+    let qn_bytes = child.name().into_inner();
     if rest.is_empty() {
-        let _ = reader.read_to_end_into(quick_xml::name::QName(qn_bytes), buf);
+        let _ = reader.read_to_end(quick_xml::name::QName(qn_bytes));
         let pos_after = reader.buffer_position() as usize;
         out.push(Item::Element(input[pos_before..pos_after].to_vec()));
         Ok(true)
     } else {
         let prev_len = out.len();
-        enter(reader, input, buf, Some(child), rest, out)?;
+        enter(reader, input, Some(child), rest, out)?;
         Ok(out.len() > prev_len)
     }
 }
@@ -442,41 +429,40 @@ fn descend_or_capture<'i>(
 fn handle_match_start<'i>(
     reader: &mut Reader<&'i [u8]>,
     input: &'i [u8],
-    buf: &mut Vec<u8>,
     child: BytesStart<'static>,
-    qn_bytes: &[u8],
     index: &ChildIndex,
     count: usize,
     rest: &[Step],
     out: &mut Vec<Item>,
     pos_before: usize,
 ) -> Result<Option<bool>, EngineError> {
+    let qn_bytes = child.name().into_inner();
     match index {
         ChildIndex::Auto => {
             // `Auto` with empty rest emits each match (terminal multi). The
             // ambiguity check only applies when there are follow-on steps,
             // and that path is handled by `enter`'s deferred branch.
             Ok(Some(descend_or_capture(
-                reader, input, buf, &child, qn_bytes, rest, out, pos_before,
+                reader, input, &child, rest, out, pos_before,
             )?))
         }
         ChildIndex::Nth(n) => {
             if count == n + 1 {
                 Ok(Some(descend_or_capture(
-                    reader, input, buf, &child, qn_bytes, rest, out, pos_before,
+                    reader, input, &child, rest, out, pos_before,
                 )?))
             } else {
-                let _ = reader.read_to_end_into(quick_xml::name::QName(qn_bytes), buf);
+                let _ = reader.read_to_end(quick_xml::name::QName(qn_bytes));
                 Ok(None)
             }
         }
         ChildIndex::Each => {
             Ok(Some(descend_or_capture(
-                reader, input, buf, &child, qn_bytes, rest, out, pos_before,
+                reader, input, &child, rest, out, pos_before,
             )?))
         }
         ChildIndex::Count => {
-            let _ = reader.read_to_end_into(quick_xml::name::QName(qn_bytes), buf);
+            let _ = reader.read_to_end(quick_xml::name::QName(qn_bytes));
             Ok(None)
         }
         ChildIndex::FilterFirst(filter) | ChildIndex::FilterAll(filter) => {
@@ -491,16 +477,16 @@ fn handle_match_start<'i>(
                 };
                 if pred_passes {
                     Ok(Some(descend_or_capture(
-                        reader, input, buf, &child, qn_bytes, rest, out, pos_before,
+                        reader, input, &child, rest, out, pos_before,
                     )?))
                 } else {
-                    let _ = reader.read_to_end_into(quick_xml::name::QName(qn_bytes), buf);
+                    let _ = reader.read_to_end(quick_xml::name::QName(qn_bytes));
                     Ok(Some(false))
                 }
             } else {
                 // General path: capture the candidate's bytes <e>...</e>
                 // and run the predicate + remaining-path on the fragment.
-                let _ = reader.read_to_end_into(quick_xml::name::QName(qn_bytes), buf);
+                let _ = reader.read_to_end(quick_xml::name::QName(qn_bytes));
                 let pos_after = reader.buffer_position() as usize;
                 let fragment = &input[pos_before..pos_after];
                 if eval_filter(fragment, filter)? {
@@ -585,13 +571,12 @@ fn apply_within_fragment(
     let mut reader = Reader::from_reader(fragment);
     reader.config_mut().trim_text(false);
     reader.config_mut().expand_empty_elements = false;
-    let mut buf = Vec::new();
+    reader.config_mut().check_end_names = false;
     loop {
-        buf.clear();
-        match reader.read_event_into(&mut buf) {
+        match reader.read_event() {
             Ok(Event::Start(start)) => {
                 let owned = start.into_owned();
-                match enter(&mut reader, fragment, &mut buf, Some(&owned), inner_steps, out) {
+                match enter(&mut reader, fragment, Some(&owned), inner_steps, out) {
                     Ok(()) | Err(EngineError::Done) => {}
                     Err(e) => return Err(e),
                 }
@@ -660,35 +645,32 @@ fn eval_child_filter_fast(
     let mut reader = Reader::from_reader(fragment);
     reader.config_mut().trim_text(false);
     reader.config_mut().expand_empty_elements = false;
-    let mut buf: Vec<u8> = Vec::new();
+    reader.config_mut().check_end_names = false;
     let mut entered_root = false;
 
     loop {
-        buf.clear();
-        match reader.read_event_into(&mut buf) {
+        match reader.read_event() {
             Ok(Event::Start(s)) => {
                 if !entered_root {
                     entered_root = true;
                     continue;
                 }
-                let qn = s.name();
-                let qn_raw = qn.into_inner();
+                let qn_raw = s.name().into_inner();
                 let local_raw = local_name_bytes(qn_raw);
                 if pred_name.matches_bytes(qn_raw, local_raw) {
-                    let text = read_text_in_scope(&mut reader, &mut buf);
+                    let text = read_text_in_scope(&mut reader);
                     let raw = std::str::from_utf8(&text).unwrap_or("");
                     return compare(raw, op, value);
                 }
-                let qn_skip: SmallVec<[u8; 64]> = SmallVec::from_slice(qn_raw);
-                let _ = reader.read_to_end_into(quick_xml::name::QName(&qn_skip), &mut buf);
+                // qn_raw borrows from fragment; no workaround needed.
+                let _ = reader.read_to_end(quick_xml::name::QName(qn_raw));
             }
             Ok(Event::Empty(s)) => {
                 if !entered_root {
                     // Empty root: nothing inside can match
                     return false;
                 }
-                let qn = s.name();
-                let qn_raw = qn.into_inner();
+                let qn_raw = s.name().into_inner();
                 let local_raw = local_name_bytes(qn_raw);
                 if pred_name.matches_bytes(qn_raw, local_raw) {
                     // Empty element → empty text
@@ -725,7 +707,7 @@ fn eval_simple_child_filter_and_collect(
     let mut reader = Reader::from_reader(fragment);
     reader.config_mut().trim_text(false);
     reader.config_mut().expand_empty_elements = false;
-    let mut buf: Vec<u8> = Vec::new();
+    reader.config_mut().check_end_names = false;
 
     let mut pred_text: Option<Vec<u8>> = None;
     let mut collected: Vec<Item> = Vec::new();
@@ -734,25 +716,21 @@ fn eval_simple_child_filter_and_collect(
 
     loop {
         let pos_before = reader.buffer_position() as usize;
-        buf.clear();
-        match reader.read_event_into(&mut buf) {
+        match reader.read_event() {
             Ok(Event::Start(s)) => {
                 if !entered_root {
                     entered_root = true;
                     continue;
                 }
-                let owned = s.into_owned();
-                let raw = owned.name().into_inner();
+                let raw = s.name().into_inner();
                 let local = local_name_bytes(raw);
-                let qn_owned: SmallVec<[u8; 64]> = SmallVec::from_slice(raw);
 
                 if pred_name.matches_bytes(raw, local) {
                     if pred_text.is_none() {
-                        pred_text = Some(read_text_in_scope(&mut reader, &mut buf));
+                        pred_text = Some(read_text_in_scope(&mut reader));
                     } else {
-                        let _ = reader.read_to_end_into(
-                            quick_xml::name::QName(&qn_owned), &mut buf,
-                        );
+                        // raw borrows from fragment; no workaround needed.
+                        let _ = reader.read_to_end(quick_xml::name::QName(raw));
                     }
                 } else if rest_name.matches_bytes(raw, local) {
                     rest_count += 1;
@@ -764,19 +742,15 @@ fn eval_simple_child_filter_and_collect(
                     if take {
                         match terminal_shape {
                             TerminalShape::Count => {
-                                let _ = reader.read_to_end_into(
-                                    quick_xml::name::QName(&qn_owned), &mut buf,
-                                );
+                                let _ = reader.read_to_end(quick_xml::name::QName(raw));
                                 collected.push(Item::Scalar(Vec::new()));
                             }
                             TerminalShape::Text => {
-                                let text = read_text_in_scope(&mut reader, &mut buf);
+                                let text = read_text_in_scope(&mut reader);
                                 collected.push(Item::Text(text));
                             }
                             TerminalShape::Element => {
-                                let _ = reader.read_to_end_into(
-                                    quick_xml::name::QName(&qn_owned), &mut buf,
-                                );
+                                let _ = reader.read_to_end(quick_xml::name::QName(raw));
                                 let pos_after = reader.buffer_position() as usize;
                                 collected.push(Item::Element(
                                     fragment[pos_before..pos_after].to_vec(),
@@ -784,22 +758,17 @@ fn eval_simple_child_filter_and_collect(
                             }
                         }
                     } else {
-                        let _ = reader.read_to_end_into(
-                            quick_xml::name::QName(&qn_owned), &mut buf,
-                        );
+                        let _ = reader.read_to_end(quick_xml::name::QName(raw));
                     }
                 } else {
-                    let _ = reader.read_to_end_into(
-                        quick_xml::name::QName(&qn_owned), &mut buf,
-                    );
+                    let _ = reader.read_to_end(quick_xml::name::QName(raw));
                 }
             }
             Ok(Event::Empty(s)) => {
                 if !entered_root {
                     break; // empty root: pred_text stays None → predicate fails
                 }
-                let qn = s.name();
-                let raw = qn.into_inner();
+                let raw = s.name().into_inner();
                 let local = local_name_bytes(raw);
 
                 if pred_name.matches_bytes(raw, local) {
@@ -907,12 +876,11 @@ fn local_name_bytes(qname: &[u8]) -> &[u8] {
     }
 }
 
-fn read_text_in_scope(reader: &mut Reader<&[u8]>, buf: &mut Vec<u8>) -> Vec<u8> {
+fn read_text_in_scope(reader: &mut Reader<&[u8]>) -> Vec<u8> {
     let mut out = Vec::new();
     let mut depth: i32 = 1;
     loop {
-        buf.clear();
-        match reader.read_event_into(buf) {
+        match reader.read_event() {
             Ok(Event::Start(_)) => depth += 1,
             Ok(Event::End(_)) => {
                 depth -= 1;
@@ -936,11 +904,10 @@ fn read_text_in_scope(reader: &mut Reader<&[u8]>, buf: &mut Vec<u8>) -> Vec<u8> 
 }
 
 
-fn consume_to_end(reader: &mut Reader<&[u8]>, buf: &mut Vec<u8>, scoped: bool) {
+fn consume_to_end(reader: &mut Reader<&[u8]>, scoped: bool) {
     let mut depth: i32 = 1;
     loop {
-        buf.clear();
-        match reader.read_event_into(buf) {
+        match reader.read_event() {
             Ok(Event::Start(_)) => depth += 1,
             Ok(Event::End(_)) => {
                 if scoped {
@@ -962,7 +929,7 @@ fn consume_to_end(reader: &mut Reader<&[u8]>, buf: &mut Vec<u8>, scoped: bool) {
 // `run_many` drives a single `quick_xml::Reader` over `xml`, evaluating
 // multiple Program objects in lock-step. Each program maintains its own
 // ProgState (cursor, counters, flags) inside the current recursion frame.
-// A subtree is skipped via `read_to_end_into` only when no active program
+// A subtree is skipped via `read_to_end` only when no active program
 // needs to descend into it, preserving the single-scan speed advantage.
 
 /// Per-program state for one recursion frame of `scan_many_children`.
@@ -1022,7 +989,7 @@ pub fn run_many(
         let mut reader = Reader::from_reader(xml);
         reader.config_mut().trim_text(false);
         reader.config_mut().expand_empty_elements = false;
-        let mut buf: Vec<u8> = Vec::new();
+        reader.config_mut().check_end_names = false;
 
         // Initial states: scanning at document-root level (current = None).
         let mut states: Vec<ProgState> = non_empty
@@ -1031,7 +998,7 @@ pub fn run_many(
             .collect();
 
         // Scan at document root level (no enclosing element, scoped=false).
-        scan_many_children(&mut reader, xml, &mut buf, None, programs, &mut states, &mut outs, borrowable)?;
+        scan_many_children(&mut reader, xml, None, programs, &mut states, &mut outs, borrowable)?;
     }
 
     for i in 0..n {
@@ -1055,7 +1022,7 @@ pub fn run_many_within(
         let mut reader = Reader::from_reader(fragment);
         reader.config_mut().trim_text(false);
         reader.config_mut().expand_empty_elements = false;
-        let mut buf: Vec<u8> = Vec::new();
+        reader.config_mut().check_end_names = false;
 
         let mut states: Vec<ProgState> = non_empty
             .iter()
@@ -1064,17 +1031,14 @@ pub fn run_many_within(
 
         // Skip the outer element's Start tag, then scan inside it.
         loop {
-            buf.clear();
-            match reader.read_event_into(&mut buf) {
+            match reader.read_event() {
                 Ok(Event::Start(start)) => {
-                    let owned = start.into_owned();
                     // Handle Attr/Text terminals that target the outer element.
-                    collect_many_attr_text(Some(&owned), programs, &mut states, &mut outs);
+                    collect_many_attr_text(Some(&start), programs, &mut states, &mut outs);
                     scan_many_children(
                         &mut reader,
                         fragment,
-                        &mut buf,
-                        Some(&owned),
+                        Some(&start),
                         programs,
                         &mut states,
                         &mut outs,
@@ -1083,8 +1047,7 @@ pub fn run_many_within(
                     break;
                 }
                 Ok(Event::Empty(start)) => {
-                    let owned = start.into_owned();
-                    collect_many_attr_text(Some(&owned), programs, &mut states, &mut outs);
+                    collect_many_attr_text(Some(&start), programs, &mut states, &mut outs);
                     break;
                 }
                 Ok(Event::Eof) => break,
@@ -1144,7 +1107,6 @@ fn collect_many_attr_text(
 fn scan_many_children<'i>(
     reader: &mut Reader<&'i [u8]>,
     input: &'i [u8],
-    buf: &mut Vec<u8>,
     current: Option<&BytesStart<'_>>,
     programs: &[&Program],
     states: &mut Vec<ProgState>,
@@ -1152,7 +1114,7 @@ fn scan_many_children<'i>(
     borrowable: bool,
 ) -> Result<(), EngineError> {
     if states.is_empty() {
-        consume_to_end(reader, buf, current.is_some());
+        consume_to_end(reader, current.is_some());
         return Ok(());
     }
 
@@ -1161,31 +1123,22 @@ fn scan_many_children<'i>(
         .iter()
         .any(|s| matches!(programs[s.id].steps.get(s.cursor), Some(Step::Child { .. })));
     if !any_child_step {
-        consume_to_end(reader, buf, current.is_some());
+        consume_to_end(reader, current.is_some());
         return Ok(());
     }
 
     loop {
         let pos_before = reader.buffer_position() as usize;
-        buf.clear();
-        match reader.read_event_into(buf) {
+        match reader.read_event() {
             Ok(Event::Start(child)) => {
-                // A1: single into_owned() allocation; derive qn_bytes from it.
-                let owned = child.into_owned();
-                let qn_bytes = owned.name().into_inner();
-
                 process_many_start(
-                    reader, input, buf, &owned, qn_bytes,
+                    reader, input, child,
                     pos_before, programs, states, outs, borrowable,
                 )?;
             }
             Ok(Event::Empty(child)) => {
-                // A1: same pattern for Empty events.
-                let owned = child.into_owned();
-                let qn_bytes = owned.name().into_inner();
-
                 process_many_empty(
-                    &owned, qn_bytes,
+                    child,
                     programs, states, outs,
                 )?;
             }
@@ -1208,15 +1161,14 @@ fn scan_many_children<'i>(
 fn process_many_start<'i>(
     reader: &mut Reader<&'i [u8]>,
     input: &'i [u8],
-    buf: &mut Vec<u8>,
-    owned: &BytesStart<'static>,
-    qn_bytes: &[u8],
+    child: BytesStart<'i>,
     pos_before: usize,
     programs: &[&Program],
     states: &mut Vec<ProgState>,
     outs: &mut Vec<Vec<Item>>,
     borrowable: bool,
 ) -> Result<(), EngineError> {
+    let qn_bytes: &[u8] = child.name().into_inner();
     // A3: compute local once from raw bytes; avoid per-program UTF-8 decoding.
     let local = local_name_bytes(qn_bytes);
 
@@ -1329,7 +1281,7 @@ fn process_many_start<'i>(
 
     if all_emit_text_only {
         // Read text in-place; reader advances past the end tag.
-        let text = read_text_in_scope(reader, buf);
+        let text = read_text_in_scope(reader);
         let item = Item::Text(text);
         for (s, act) in states.iter_mut().zip(actions.iter()) {
             if matches!(act, Action::EmitTerminal) {
@@ -1368,10 +1320,10 @@ fn process_many_start<'i>(
                     _ => {}
                 }
             }
-            collect_many_attr_text(Some(owned), programs, &mut child_states, outs);
-            scan_many_children(reader, input, buf, Some(owned), programs, &mut child_states, outs, borrowable)?;
+            collect_many_attr_text(Some(&child), programs, &mut child_states, outs);
+            scan_many_children(reader, input, Some(&child), programs, &mut child_states, outs, borrowable)?;
         } else {
-            let _ = reader.read_to_end_into(quick_xml::name::QName(qn_bytes), buf);
+            let _ = reader.read_to_end(quick_xml::name::QName(qn_bytes));
         }
 
         let pos_after = if needs_bytes { reader.buffer_position() as usize } else { 0 };
@@ -1419,7 +1371,7 @@ fn process_many_start<'i>(
 
                     if let Some(attr_name) = filter.attr_only.as_deref() {
                         // Attr predicate checked directly from start tag — no parse.
-                        let passes = read_attr_str(owned, attr_name)
+                        let passes = read_attr_str(&child, attr_name)
                             .map(|v| compare(&v, &filter.op, &filter.value))
                             .unwrap_or(false);
                         if passes {
@@ -1456,20 +1408,20 @@ fn process_many_start<'i>(
         }
     } else {
         // No program needs this subtree: skip entirely.
-        let _ = reader.read_to_end_into(quick_xml::name::QName(qn_bytes), buf);
+        let _ = reader.read_to_end(quick_xml::name::QName(qn_bytes));
     }
 
     Ok(())
 }
 
 /// Process one Empty event against all active programs.
-fn process_many_empty(
-    owned: &BytesStart<'static>,
-    qn_bytes: &[u8],
+fn process_many_empty<'i>(
+    child: BytesStart<'i>,
     programs: &[&Program],
     states: &mut Vec<ProgState>,
     outs: &mut Vec<Vec<Item>>,
 ) -> Result<(), EngineError> {
+    let qn_bytes: &[u8] = child.name().into_inner();
     // A3: byte-based local name; A4: serialize_empty only when actually needed.
     let local = local_name_bytes(qn_bytes);
     let mut frag: Option<Vec<u8>> = None;
@@ -1503,10 +1455,10 @@ fn process_many_empty(
                     continue;
                 }
                 if rest.is_empty() {
-                    let f = frag.get_or_insert_with(|| serialize_empty(owned));
+                    let f = frag.get_or_insert_with(|| serialize_empty(&child));
                     outs[s.id].push(Item::Element(f.clone()));
                 } else {
-                    handle_empty_inner(owned, rest, &mut outs[s.id]);
+                    handle_empty_inner(&child, rest, &mut outs[s.id]);
                 }
                 if s.single_shot {
                     s.done_in_scope = true;
@@ -1514,10 +1466,10 @@ fn process_many_empty(
             }
             ChildIndex::Auto | ChildIndex::Each => {
                 if rest.is_empty() {
-                    let f = frag.get_or_insert_with(|| serialize_empty(owned));
+                    let f = frag.get_or_insert_with(|| serialize_empty(&child));
                     outs[s.id].push(Item::Element(f.clone()));
                 } else {
-                    handle_empty_inner(owned, rest, &mut outs[s.id]);
+                    handle_empty_inner(&child, rest, &mut outs[s.id]);
                 }
                 if s.single_shot {
                     s.done_in_scope = true;
@@ -1525,15 +1477,15 @@ fn process_many_empty(
             }
             ChildIndex::FilterFirst(filter) | ChildIndex::FilterAll(filter) => {
                 let passes = if let Some(attr_name) = filter.attr_only.as_deref() {
-                    read_attr_str(owned, attr_name)
+                    read_attr_str(&child, attr_name)
                         .map(|v| compare(&v, &filter.op, &filter.value))
                         .unwrap_or(false)
                 } else {
-                    let f = frag.get_or_insert_with(|| serialize_empty(owned));
+                    let f = frag.get_or_insert_with(|| serialize_empty(&child));
                     eval_filter(f, filter)?
                 };
                 if passes {
-                    let f = frag.get_or_insert_with(|| serialize_empty(owned));
+                    let f = frag.get_or_insert_with(|| serialize_empty(&child));
                     apply_within_fragment(f, rest, &mut outs[s.id])?;
                     if s.single_shot {
                         s.done_in_scope = true;

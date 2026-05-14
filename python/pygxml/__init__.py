@@ -33,17 +33,22 @@ Implicit-selector rule:
     a multi-match Result.
 
 API:
-    pygxml.get(data, path)        -> Result  str input
-    pygxml.get_bytes(data, path)  -> Result  bytes input (zero-copy)
-    pygxml.get_buffer(data, path) -> Result  mmap/bytearray/memoryview input
-    pygxml.parse(data)            -> Result  Result over the full document
-    pygxml.compile(path)          -> Path    pre-compile a path for reuse
+    pygxml.get(data, path)             -> Result       str input
+    pygxml.get_bytes(data, path)       -> Result       bytes input (zero-copy)
+    pygxml.get_buffer(data, path)      -> Result       mmap/bytearray/memoryview input
+    pygxml.get_many(data, paths)       -> list[Result] str input, single scan
+    pygxml.get_many_bytes(data, paths) -> list[Result] bytes input (zero-copy)
+    pygxml.get_many_buffer(data, paths)-> list[Result] mmap/bytearray/memoryview input
+    pygxml.parse(data)                 -> Result       Result over the full document
+    pygxml.compile(path)               -> Path         pre-compile a path for reuse
+    pygxml.validate(data)              -> bool         True iff data is well-formed XML
 
 Input-type variants:
     get / get_many               accept str
     get_bytes / get_many_bytes   accept bytes (get_many_bytes uses zero-copy)
     get_buffer / get_many_buffer accept mmap.mmap, bytearray, memoryview
-    parse / validate / Path.get* accept any of the above (XmlInput)
+    parse / validate             accept any of the above (XmlInput)
+    Path.get / .get_bytes / .get_buffer  each accept their respective input type
 
 Note: ``parse(data)`` keeps a reference to the input object instead of
 copying. For mmap inputs, do not close the mmap while a Result derived

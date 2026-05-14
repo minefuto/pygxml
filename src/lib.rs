@@ -1,11 +1,16 @@
-// PyO3 entry: exposes `get`, `parse`, `compile()`, and the `Path` and `Result`
-// classes to Python.
+// PyO3 entry: exposes `get`, `get_bytes`, `get_buffer`, `get_many`,
+// `get_many_bytes`, `get_many_buffer`, `parse`, `compile`, `validate`,
+// and the `Path` and `Result` classes to Python.
 //
 // Result holds matched items by reference (`Source::Borrowed`) when produced
-// by `parse(data)`, so the entire input is not copied — the underlying mmap
-// or PyBytes is re-borrowed on demand. Items captured by descending a path
+// by `parse(data)`, so the entire input is not copied — the underlying object
+// is re-borrowed on demand. Items captured by descending a path
 // (`get(data, path)` or `Result.get(path)`) are stored as `Source::Owned`
-// since they are small fragments.
+// since they are small fragments. `get_many_bytes` uses `Source::BorrowedSlice`
+// (zero-copy byte range) backed by the immutable `PyBytes` input.
+//
+// `py_get` and `py_get_many` use `PyString::to_cow()` so canonical (already
+// UTF-8) Python strings are passed to the engine without copying.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -42,8 +47,11 @@ fn with_xml_input<R>(
         return Ok(f(b.as_bytes()));
     }
     if let Ok(s) = data.cast::<PyString>() {
-        let owned: String = s.extract()?;
-        return Ok(f(owned.as_bytes()));
+        // to_cow() is zero-copy for canonical (UTF-8-internal) Python strings;
+        // for non-canonical representations it encodes to UTF-8 and caches
+        // the result on the Python object.
+        let cow = s.to_cow()?;
+        return Ok(f(cow.as_bytes()));
     }
     // Fall back to the buffer protocol (mmap.mmap, bytearray, numpy bytes, …).
     if let Ok(buf) = PyBuffer::<u8>::get(data) {
@@ -217,11 +225,10 @@ fn element_has_child_elements(bytes: &[u8]) -> bool {
     let mut reader = Reader::from_reader(bytes);
     reader.config_mut().trim_text(false);
     reader.config_mut().expand_empty_elements = false;
-    let mut buf = Vec::new();
+    reader.config_mut().check_end_names = false;
     let mut entered_root = false;
     loop {
-        buf.clear();
-        match reader.read_event_into(&mut buf) {
+        match reader.read_event() {
             Ok(Event::Start(_)) => {
                 if !entered_root {
                     entered_root = true;
@@ -261,19 +268,20 @@ fn collect_direct_children(bytes: &[u8]) -> Vec<ChildSpan> {
     let mut reader = Reader::from_reader(bytes);
     reader.config_mut().trim_text(false);
     reader.config_mut().expand_empty_elements = false;
-    let mut buf: Vec<u8> = Vec::new();
+    reader.config_mut().check_end_names = false;
     let mut entered_root = false;
     loop {
         let pos_before = reader.buffer_position() as usize;
-        buf.clear();
-        match reader.read_event_into(&mut buf) {
+        match reader.read_event() {
             Ok(Event::Start(s)) => {
                 if !entered_root {
                     entered_root = true;
                     continue;
                 }
-                let qn: Vec<u8> = s.name().into_inner().to_vec();
-                let _ = reader.read_to_end_into(quick_xml::name::QName(&qn), &mut buf);
+                // qn borrows from `bytes` (slice-backed reader: no copy needed).
+                let qn_raw = s.name().into_inner();
+                let qn: Vec<u8> = qn_raw.to_vec();
+                let _ = reader.read_to_end(quick_xml::name::QName(qn_raw));
                 let pos_after = reader.buffer_position() as usize;
                 out.push(ChildSpan { name: qn, start: pos_before, end: pos_after });
             }
@@ -342,6 +350,10 @@ fn classify_scalar(s: &str) -> ScalarKind {
     ScalarKind::Str
 }
 
+/// Python `Result` class — wraps a list of matched items. Constructed by
+/// `py_get` / `py_parse` / `py_get_many` etc. and dispatches `__getitem__`,
+/// `__iter__`, `to_str`, `to_int`, and so on based on the number and type of
+/// items held (Empty / ScalarLike / DictElement / Multi mode).
 #[pyclass(name = "Result", module = "pygxml._pygxml", frozen)]
 struct PyResult_ {
     items: Vec<PyItem>,
@@ -465,8 +477,21 @@ impl PyResult_ {
         match self.mode(py)? {
             Mode::Empty => Ok(String::new()),
             Mode::ScalarLike => {
-                let val = self.value(py)?;
-                Ok(val.bind(py).str()?.to_string_lossy().into_owned())
+                match self.items.first() {
+                    Some(PyItem::Scalar(v)) => {
+                        // Skip classify_scalar and Python object roundtrip.
+                        std::str::from_utf8(v.as_slice())
+                            .map(|s| s.trim().to_owned())
+                            .map_err(|e| PyValueError::new_err(e.to_string()))
+                    }
+                    Some(it @ PyItem::Element(_)) => {
+                        let bytes = it.text(py)?;
+                        let s = String::from_utf8(bytes)
+                            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                        Ok(s.trim().to_owned())
+                    }
+                    None => Ok(String::new()),
+                }
             }
             Mode::Multi | Mode::DictElement => self.xml_string(py),
         }
@@ -1333,8 +1358,9 @@ fn py_get(py: Python<'_>, data: &Bound<'_, PyString>, path: &str) -> PyResult<Py
         return Py::new(py, PyResult_::new(Vec::new()));
     }
     let prog = compile_path(path)?;
-    let owned: String = data.extract()?;
-    let items = engine::run(&prog, owned.as_bytes()).map_err(engine_err_to_py)?;
+    // to_cow() is zero-copy for canonical Python strings (UTF-8 internal repr).
+    let cow = data.to_cow()?;
+    let items = engine::run(&prog, cow.as_bytes()).map_err(engine_err_to_py)?;
     Py::new(py, PyResult_::new(lift(items)))
 }
 
@@ -1411,8 +1437,9 @@ fn py_get_many(
         vec![]
     } else {
         let prog_refs: Vec<&path::Program> = active.iter().map(|p| p.as_ref()).collect();
-        let owned: String = data.extract()?;
-        run_many(&prog_refs, owned.as_bytes(), false).map_err(engine_err_to_py)?
+        // to_cow() is zero-copy for canonical Python strings (UTF-8 internal repr).
+        let cow = data.to_cow()?;
+        run_many(&prog_refs, cow.as_bytes(), false).map_err(engine_err_to_py)?
     };
     let mut engine_iter = engine_results.drain(..);
     for opt in &programs {

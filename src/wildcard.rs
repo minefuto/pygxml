@@ -30,13 +30,6 @@ impl NameMatcher {
         }
     }
 
-    /// Match an element name. The caller passes the full qualified name (e.g.
-    /// `atom:entry`) and the bare local name (`entry`). Patterns with no `:`
-    /// match by local name (namespace-agnostic, the gjson default). Patterns
-    /// containing `:` are treated as a prefix-aware literal — they match the
-    /// full qualified name. This catches the common case of stable XML
-    /// prefixes (`xmlns:atom="..."` declared at document root) without the
-    /// complexity of full URI resolution.
     /// Pattern source as written by the user, suitable for error messages.
     pub fn as_source(&self) -> &str {
         match self {
@@ -44,6 +37,13 @@ impl NameMatcher {
         }
     }
 
+    /// Match an element name. The caller passes the full qualified name (e.g.
+    /// `atom:entry`) and the bare local name (`entry`). Patterns with no `:`
+    /// match by local name (namespace-agnostic, the gjson default). Patterns
+    /// containing `:` are treated as a prefix-aware literal — they match the
+    /// full qualified name. This catches the common case of stable XML
+    /// prefixes (`xmlns:atom="..."` declared at document root) without the
+    /// complexity of full URI resolution.
     pub fn matches(&self, full: &str, local: &str) -> bool {
         match self {
             NameMatcher::Exact(s) => {
