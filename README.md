@@ -54,6 +54,15 @@ r.get("store.book.#(price>=30)#.title").value             # [Result('XML in a Nu
 # get_many — scan the document once and return multiple Results.
 title, price = pygxml.get_many(xml, ["store.book.0.title", "store.book.0.price"])
 
+# compile() — pre-compile a path for reuse across many documents.
+path = pygxml.compile("store.book.0.title")
+path.get(xml).to_str()                                    # 'XML in a Nutshell'
+
+# Compiled paths can also be passed to get_many / get_many_bytes / get_many_buffer.
+title_path = pygxml.compile("store.book.0.title")
+price_path = pygxml.compile("store.book.0.price")
+title, price = pygxml.get_many(xml, [title_path, price_path])
+
 # mmap input — true zero-copy on huge files. parse(mm) keeps the mmap by
 # reference, so subsequent .get() calls re-borrow it without copying.
 import mmap
@@ -72,16 +81,17 @@ pygxml.validate(xml)                                        # True
 ### Module-level functions
 
 
-| Function                        | Description                                              |
-|---------------------------------|----------------------------------------------------------|
-| `get(xml, path)`               | Query `xml` (str) at `path`; returns `Result`           |
-| `get_bytes(xml, path)`         | Query `xml` (bytes) at `path`; returns `Result`         |
-| `get_buffer(xml, path)`         | Query `xml` (buffer protocol) at `path`; returns `Result`         |
-| `get_many(xml, paths)`         | Query `xml` (str) at each path; returns `list[Result]`  |
-| `get_many_bytes(xml, paths)`   | Query `xml` (bytes) at each path; returns `list[Result]`|
-| `get_many_buffer(xml, paths)`   | Query `xml` (buffer protocol) at each path; returns `list[Result]`|
-| `parse(xml)`                   | Parse the entire JSON document into a `Result`           |
-| `validate(xml)`                | `True` if `xml` is syntactically valid                  |
+| Function                        | Description                                                                     |
+|---------------------------------|---------------------------------------------------------------------------------|
+| `get(xml, path)`               | Query `xml` (str) at `path`; returns `Result`                                  |
+| `get_bytes(xml, path)`         | Query `xml` (bytes) at `path`; returns `Result`                                |
+| `get_buffer(xml, path)`         | Query `xml` (buffer protocol) at `path`; returns `Result`                      |
+| `get_many(xml, paths)`         | Query `xml` (str) at each path (str or `Path`); returns `list[Result]`         |
+| `get_many_bytes(xml, paths)`   | Query `xml` (bytes) at each path (str or `Path`); returns `list[Result]`       |
+| `get_many_buffer(xml, paths)`   | Query `xml` (buffer protocol) at each path (str or `Path`); returns `list[Result]` |
+| `parse(xml)`                   | Parse the entire XML document into a `Result`                                   |
+| `validate(xml)`                | `True` if `xml` is syntactically valid                                         |
+| `compile(path)`                | Pre-compile a path expression; returns a `Path`                                 |
 
 
 ### Result
@@ -134,6 +144,21 @@ children, so `.get(...)` against them yields an empty Result.
 | `v.items()`         | Lazy `ItemsView` of `(key, Result)` pairs (raises `TypeError` for non-dict) |
 | `r == "x"`, `r == ["a", "b"]`, `r == other_result` | Equality with str/list/Result |
 
+
+### Path
+
+`compile(path)` returns a `Path` — a compiled, reusable path expression.
+Using a pre-compiled `Path` avoids re-parsing the path string on every call,
+which matters when querying many documents with the same path.
+
+| Method              | Description                                                       |
+|---------------------|-------------------------------------------------------------------|
+| `p.get(data)`       | Query XML string `data`; equivalent to `get(data, path)`         |
+| `p.get_bytes(data)` | Query XML bytes `data`                                            |
+| `p.get_buffer(data)`| Query buffer-protocol `data` (mmap, bytearray, memoryview)       |
+
+`Path` objects are also accepted wherever a path string is accepted:
+`get_many`, `get_many_bytes`, `get_many_buffer`, and `Result.get_many`.
 
 ## Path syntax
 
