@@ -69,7 +69,7 @@ impl core::fmt::Display for EngineError {
 }
 
 /// Per-run flags threaded through the single-program evaluator.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct RunCtx {
     /// Emit `Item::ElementRef` (zero-copy byte range into the run's input)
     /// instead of `Item::Element(to_vec())` for element terminals. Only valid
@@ -79,6 +79,21 @@ struct RunCtx {
     /// program's first modifier is `@first` — later modifiers then operate on
     /// the same single-item list they would have seen after truncation.
     stop_first: bool,
+    /// True while every ancestor frame's step can produce no further results
+    /// after the current descent: `Nth` / `FilterFirst` emit at most once, and
+    /// `Auto`-with-rest errors (rather than emits) on a second match. While
+    /// the chain holds, a single-shot emission may unwind the whole scan
+    /// (`EngineError::Done`) without changing the result set. Once an `Each` /
+    /// `FilterAll` / descendant frame is entered, single-shot completion is
+    /// scope-local: skip to the end of the current scope and let the parent
+    /// keep scanning — matching `run_many`'s `done_in_scope` semantics.
+    chain_single: bool,
+}
+
+impl Default for RunCtx {
+    fn default() -> Self {
+        RunCtx { borrowable: false, stop_first: false, chain_single: true }
+    }
 }
 
 /// True when the program's result is fully determined by its first item.
@@ -99,6 +114,7 @@ pub fn run_with(program: &Program, xml: &[u8], borrowable: bool) -> Result<Vec<I
         let ctx = RunCtx {
             borrowable,
             stop_first: stops_after_first(program),
+            chain_single: true,
         };
         let mut reader = Reader::from_reader(xml);
         reader.config_mut().trim_text(false);
@@ -384,7 +400,14 @@ fn enter<'i>(
                             ctx,
                         )? {
                             if emitted && single_shot {
-                                return Err(EngineError::Done);
+                                if ctx.chain_single {
+                                    return Err(EngineError::Done);
+                                }
+                                // Scope-local completion (an Each/FilterAll/
+                                // descendant ancestor may still emit): skip the
+                                // rest of this scope, resume in the parent.
+                                consume_to_end(reader, current.is_some());
+                                return Ok(());
                             }
                         }
                     }
@@ -392,8 +415,10 @@ fn enter<'i>(
                     // Descendant marker (`**.name`): keep looking for `name`
                     // inside this child's subtree. Pass the same `steps` so
                     // the search continues at deeper levels. Descendant target
-                    // is always `Each` — never short-circuits, never errors.
-                    enter(reader, input, Some(&child), steps, out, ctx)?;
+                    // is always `Each` — never short-circuits, never errors,
+                    // and may emit again → single-shot chain is broken.
+                    let child_ctx = RunCtx { chain_single: false, ..ctx };
+                    enter(reader, input, Some(&child), steps, out, child_ctx)?;
                 } else {
                     // qn_raw borrows from input (not from a temporary buf),
                     // so it can be passed directly to read_to_end.
@@ -417,7 +442,11 @@ fn enter<'i>(
                         let emitted =
                             handle_match_empty(&child, &index, count, rest, out)?;
                         if emitted && single_shot {
-                            return Err(EngineError::Done);
+                            if ctx.chain_single {
+                                return Err(EngineError::Done);
+                            }
+                            consume_to_end(reader, current.is_some());
+                            return Ok(());
                         }
                     }
                 }
@@ -505,8 +534,11 @@ fn handle_match_start<'i>(
             }
         }
         ChildIndex::Each => {
+            // Each may emit again for later siblings → deeper single-shot
+            // steps must complete scope-locally, not unwind the whole scan.
+            let child_ctx = RunCtx { chain_single: false, ..ctx };
             Ok(Some(descend_or_capture(
-                reader, input, child, rest, out, pos_before, ctx,
+                reader, input, child, rest, out, pos_before, child_ctx,
             )?))
         }
         ChildIndex::Count => {
@@ -514,6 +546,13 @@ fn handle_match_start<'i>(
             Ok(None)
         }
         ChildIndex::FilterFirst(filter) | ChildIndex::FilterAll(filter) => {
+            // FilterAll keeps matching later siblings → break the chain;
+            // FilterFirst emits at most once → chain preserved.
+            let child_ctx = if matches!(index, ChildIndex::FilterAll(_)) {
+                RunCtx { chain_single: false, ..ctx }
+            } else {
+                ctx
+            };
             // Fast path: predicates of the form `@attr op value` can be
             // evaluated directly against the start tag, with no need to
             // capture or re-parse the subtree.
@@ -525,7 +564,7 @@ fn handle_match_start<'i>(
                 };
                 if pred_passes {
                     Ok(Some(descend_or_capture(
-                        reader, input, child, rest, out, pos_before, ctx,
+                        reader, input, child, rest, out, pos_before, child_ctx,
                     )?))
                 } else {
                     let _ = reader.read_to_end(quick_xml::name::QName(qn_bytes));
@@ -1903,6 +1942,41 @@ mod tests {
     #[test]
     fn each_attr() {
         assert_eq!(run_path(BOOKS, "store.book.#.@id"), vec!["b1", "b2", "b3"]);
+    }
+
+    #[test]
+    fn nth_under_each_is_scope_local() {
+        // `.0` nested under `.#` completes per book, not globally: each book
+        // contributes its own title.0 — parity with run_many.
+        let xml = br#"<store>
+          <book><title>T1</title><title>T1b</title></book>
+          <book><title>T2</title></book>
+          <book><title>T3</title></book>
+        </store>"#;
+        assert_eq!(run_path(xml, "store.book.#.title.0"), vec!["T1", "T2", "T3"]);
+        assert_eq!(run_path(xml, "store.book.#.title.1"), vec!["T1b"]);
+
+        // Same results from the multi-program engine.
+        let prog = path::compile("store.book.#.title.0").unwrap();
+        let single: Vec<Vec<u8>> = run(&prog, xml)
+            .unwrap()
+            .iter()
+            .map(|it| item_text(it, xml))
+            .collect();
+        let many: Vec<Vec<u8>> = run_many(&[&prog], xml, false)
+            .unwrap()
+            .remove(0)
+            .iter()
+            .map(|it| item_text(it, xml))
+            .collect();
+        assert_eq!(single, many);
+    }
+
+    #[test]
+    fn nth_chain_from_root_still_single() {
+        // A pure Nth/Auto chain keeps the whole-scan early exit and returns
+        // exactly one item.
+        assert_eq!(run_path(BOOKS, "store.book.0.title"), vec!["XML in a Nutshell"]);
     }
 
     #[test]

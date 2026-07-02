@@ -42,6 +42,29 @@ def test_single_path_parity_with_get():
         assert str(single) == str(many[0]), f"Mismatch for path {p!r}"
 
 
+def test_nested_nth_parity_with_get():
+    # `.N` nested under `.#` completes per scope: get and get_many must both
+    # return one item per book, in document order.
+    xml = (
+        b"<store>"
+        b"<book><title>T1</title><title>T1b</title><price>30</price></book>"
+        b"<book><title>T2</title><price>20</price></book>"
+        b"<book><title>T3</title><price>45</price></book>"
+        b"</store>"
+    )
+    for p in [
+        "store.book.#.title.0",
+        "store.book.#.title.1",
+        "store.book.#.price.0|@sum",
+        "store.book.#.price.0|@sort",
+    ]:
+        single = pygxml.get_bytes(xml, p)
+        many = pygxml.get_many_bytes(xml, [p])[0]
+        assert single.value == many.value, f"Mismatch for path {p!r}"
+    assert pygxml.get_bytes(xml, "store.book.#.title.0").value == ["T1", "T2", "T3"]
+    assert pygxml.get_bytes(xml, "store.book.#.price.0|@sum").value == 95
+
+
 def test_order_preserved():
     paths = ["store.book.0.title", "store.book.#", "store.book.1.@id"]
     rs = pygxml.get_many_bytes(BOOKS, paths)
