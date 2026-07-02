@@ -12,7 +12,8 @@
 // `py_get` and `py_get_many` use `PyString::to_cow()` so canonical (already
 // UTF-8) Python strings are passed to the engine without copying.
 
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use pyo3::buffer::PyBuffer;
@@ -26,7 +27,7 @@ mod engine;
 mod path;
 mod wildcard;
 
-use engine::{extract_element_text, run_many, run_many_within, validate, EngineError, Item};
+use engine::{extract_element_text, run_many, run_many_within, run_with, validate, EngineError, Item};
 use path::Program;
 
 fn engine_err_to_py(err: EngineError) -> pyo3::PyErr {
@@ -105,10 +106,35 @@ fn with_buffer_input<R>(data: &Bound<'_, PyAny>, f: impl FnOnce(&[u8]) -> R) -> 
     Ok(result)
 }
 
+// Compiling a path is a pure function of the path string, so the result is
+// memoized. Every get*/get_many*/Result.get call funnels through here, so the
+// cache removes repeated tokenize+build work when the same path is queried many
+// times (the common case). Thread-local, so no locking is needed: PyO3 calls
+// run under the GIL, and separate threads each keep their own small cache.
+const PATH_CACHE_CAP: usize = 512;
+
+thread_local! {
+    static PATH_CACHE: RefCell<HashMap<String, Arc<Program>>> =
+        RefCell::new(HashMap::new());
+}
+
 fn compile_path(path: &str) -> PyResult<Arc<Program>> {
-    path::compile(path)
+    if let Some(prog) = PATH_CACHE.with(|c| c.borrow().get(path).cloned()) {
+        return Ok(prog);
+    }
+    let prog = path::compile(path)
         .map(Arc::new)
-        .map_err(|e| PyValueError::new_err(e.to_string()))
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    PATH_CACHE.with(|c| {
+        let mut map = c.borrow_mut();
+        // Bound the cache; on overflow drop everything (rare for realistic path
+        // sets) to avoid unbounded growth on pathological input.
+        if map.len() >= PATH_CACHE_CAP {
+            map.clear();
+        }
+        map.insert(path.to_string(), Arc::clone(&prog));
+    });
+    Ok(prog)
 }
 
 fn compile_path_opt(path: &str) -> PyResult<Option<Arc<Program>>> {
@@ -121,7 +147,9 @@ fn compile_path_opt(path: &str) -> PyResult<Option<Arc<Program>>> {
 /// The bytes backing an `Item::Element`.
 enum Source {
     /// Bytes captured from a previous engine run — small and self-contained.
-    Owned(Vec<u8>),
+    /// Arc-shared so `clone_ref` (Multi-mode iteration / `.value` / indexing)
+    /// is a refcount bump instead of a byte copy.
+    Owned(Arc<Vec<u8>>),
     /// A reference back to the original Python input. Re-borrowed on each
     /// access via `with_xml_input` (zero-copy for bytes/mmap/buffer).
     Borrowed(Py<PyAny>),
@@ -170,7 +198,7 @@ impl PyItem {
     fn clone_ref(&self, py: Python<'_>) -> Self {
         match self {
             PyItem::Scalar(v) => PyItem::Scalar(v.clone()),
-            PyItem::Element(Source::Owned(v)) => PyItem::Element(Source::Owned(v.clone())),
+            PyItem::Element(Source::Owned(v)) => PyItem::Element(Source::Owned(Arc::clone(v))),
             PyItem::Element(Source::Borrowed(obj)) => {
                 PyItem::Element(Source::Borrowed(obj.clone_ref(py)))
             }
@@ -191,21 +219,22 @@ fn lift(items: Vec<Item>) -> Vec<PyItem> {
     items
         .into_iter()
         .map(|it| match it {
-            Item::Element(b) => PyItem::Element(Source::Owned(b)),
+            Item::Element(b) => PyItem::Element(Source::Owned(Arc::new(b))),
             Item::Scalar(b) | Item::Text(b) => PyItem::Scalar(b),
             // ElementRef without a source — shouldn't happen for borrowable=false runs.
-            Item::ElementRef { .. } => PyItem::Element(Source::Owned(Vec::new())),
+            Item::ElementRef { .. } => PyItem::Element(Source::Owned(Arc::new(Vec::new()))),
         })
         .collect()
 }
 
 /// Like `lift`, but resolves `Item::ElementRef` items as `Source::BorrowedSlice`
-/// backed by the given Python object. Called when the input is a `PyBytes`.
+/// backed by the given Python object. Called when the input is an immutable
+/// `PyBytes`/`PyString` that outlives the Result.
 fn lift_with_source(items: Vec<Item>, source: &Py<PyAny>, py: Python<'_>) -> Vec<PyItem> {
     items
         .into_iter()
         .map(|it| match it {
-            Item::Element(b) => PyItem::Element(Source::Owned(b)),
+            Item::Element(b) => PyItem::Element(Source::Owned(Arc::new(b))),
             Item::ElementRef { start, end } => PyItem::Element(Source::BorrowedSlice {
                 obj: source.clone_ref(py),
                 start,
@@ -371,6 +400,42 @@ impl PyResult_ {
         }
     }
 
+    /// Run `f` against the first item's text bytes, borrowing Scalar bytes in
+    /// place (no clone). Returns `None` only when the Result holds no items.
+    /// Used by the numeric/bool accessors, which tolerate (lossy) UTF-8.
+    fn first_text_with<R>(
+        &self,
+        py: Python<'_>,
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> PyResult<Option<R>> {
+        match self.items.first() {
+            Some(PyItem::Scalar(v)) => Ok(Some(f(v.as_slice()))),
+            Some(it) => {
+                let bytes = it.text(py)?;
+                Ok(Some(f(&bytes)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// First item's text as a trimmed `String`, surfacing UTF-8 errors. Avoids
+    /// the Scalar byte-buffer clone that `first_text` performs. Used by `type_`
+    /// and `value`, which need the textual form.
+    fn first_text_string_trimmed(&self, py: Python<'_>) -> PyResult<String> {
+        match self.items.first() {
+            Some(PyItem::Scalar(v)) => std::str::from_utf8(v.as_slice())
+                .map(|s| s.trim().to_owned())
+                .map_err(|e| PyValueError::new_err(e.to_string())),
+            Some(it) => {
+                let bytes = it.text(py)?;
+                String::from_utf8(bytes)
+                    .map(|s| s.trim().to_owned())
+                    .map_err(|e| PyValueError::new_err(e.to_string()))
+            }
+            None => Ok(String::new()),
+        }
+    }
+
     fn all_strings(&self, py: Python<'_>) -> PyResult<Vec<String>> {
         let mut out = Vec::with_capacity(self.items.len());
         for it in &self.items {
@@ -423,31 +488,32 @@ impl PyResult_ {
     }
 
     fn to_int(&self, py: Python<'_>) -> PyResult<i64> {
-        let bytes = match self.first_text(py)? {
-            Some(b) => b,
-            None => return Ok(0),
-        };
-        let s = std::str::from_utf8(&bytes).unwrap_or("").trim();
-        if s.is_empty() {
-            return Ok(0);
-        }
-        if let Ok(n) = s.parse::<i64>() {
-            return Ok(n);
-        }
-        // Fall back to float-then-truncate for "30.0" → 30.
-        if let Ok(f) = s.parse::<f64>() {
-            return Ok(f as i64);
-        }
-        Ok(0)
+        let n = self.first_text_with(py, |bytes| {
+            let s = std::str::from_utf8(bytes).unwrap_or("").trim();
+            if s.is_empty() {
+                return 0;
+            }
+            if let Ok(n) = s.parse::<i64>() {
+                return n;
+            }
+            // Fall back to float-then-truncate for "30.0" → 30.
+            if let Ok(f) = s.parse::<f64>() {
+                return f as i64;
+            }
+            0
+        })?;
+        Ok(n.unwrap_or(0))
     }
 
     fn to_float(&self, py: Python<'_>) -> PyResult<f64> {
-        let bytes = match self.first_text(py)? {
-            Some(b) => b,
-            None => return Ok(0.0),
-        };
-        let s = std::str::from_utf8(&bytes).unwrap_or("").trim();
-        Ok(s.parse::<f64>().unwrap_or(0.0))
+        let f = self.first_text_with(py, |bytes| {
+            std::str::from_utf8(bytes)
+                .unwrap_or("")
+                .trim()
+                .parse::<f64>()
+                .unwrap_or(0.0)
+        })?;
+        Ok(f.unwrap_or(0.0))
     }
 
     fn to_bool(&self, py: Python<'_>) -> PyResult<bool> {
@@ -456,21 +522,25 @@ impl PyResult_ {
             Mode::Multi | Mode::DictElement => return Ok(true),
             Mode::ScalarLike => {}
         }
-        let bytes = match self.first_text(py)? {
-            Some(b) => b,
-            None => return Ok(false),
-        };
-        let raw = std::str::from_utf8(&bytes).unwrap_or("");
-        let result = match raw {
-            "1" | "true" => true,
-            "0" | "false" => false,
-            r#""t""# | r#""1""# | r#""T""# => true,
-            r#""f""# | r#""0""# | r#""F""# => false,
-            r#""true""# | r#""TRUE""# | r#""True""# => true,
-            r#""false""# | r#""FALSE""# | r#""False""# => false,
-            _ => self.to_int(py)? != 0,
-        };
-        Ok(result)
+        let decided = self.first_text_with(py, |bytes| {
+            let raw = std::str::from_utf8(bytes).unwrap_or("");
+            match raw {
+                "1" | "true" => Some(true),
+                "0" | "false" => Some(false),
+                r#""t""# | r#""1""# | r#""T""# => Some(true),
+                r#""f""# | r#""0""# | r#""F""# => Some(false),
+                r#""true""# | r#""TRUE""# | r#""True""# => Some(true),
+                r#""false""# | r#""FALSE""# | r#""False""# => Some(false),
+                _ => None,
+            }
+        })?;
+        match decided {
+            Some(Some(b)) => Ok(b),
+            // Scalar present but not a recognized literal: numeric truthiness.
+            Some(None) => Ok(self.to_int(py)? != 0),
+            // No first item at all.
+            None => Ok(false),
+        }
     }
 
     fn to_str(&self, py: Python<'_>) -> PyResult<String> {
@@ -509,12 +579,8 @@ impl PyResult_ {
         match self.mode(py)? {
             Mode::Empty => Ok(py.None()),
             Mode::ScalarLike => {
-                let text = match self.first_text(py)? {
-                    Some(b) => String::from_utf8(b)
-                        .map_err(|e| PyValueError::new_err(e.to_string()))?,
-                    None => String::new(),
-                };
-                match classify_scalar(text.trim()) {
+                let text = self.first_text_string_trimmed(py)?;
+                match classify_scalar(&text) {
                     ScalarKind::Int(_) => Ok(PyInt::type_object(py).into_any().unbind()),
                     ScalarKind::Float(_) => Ok(PyFloat::type_object(py).into_any().unbind()),
                     ScalarKind::Str => Ok(PyString::type_object(py).into_any().unbind()),
@@ -536,15 +602,11 @@ impl PyResult_ {
         match self.mode(py)? {
             Mode::Empty => Ok(py.None()),
             Mode::ScalarLike => {
-                let text = match self.first_text(py)? {
-                    Some(b) => String::from_utf8(b)
-                        .map_err(|e| PyValueError::new_err(e.to_string()))?,
-                    None => String::new(),
-                };
-                match classify_scalar(text.trim()) {
+                let text = self.first_text_string_trimmed(py)?;
+                match classify_scalar(&text) {
                     ScalarKind::Int(n) => Ok(n.into_pyobject(py)?.into_any().unbind()),
                     ScalarKind::Float(f) => Ok(f.into_pyobject(py)?.into_any().unbind()),
-                    ScalarKind::Str => Ok(PyString::new(py, text.trim()).into_any().unbind()),
+                    ScalarKind::Str => Ok(PyString::new(py, &text).into_any().unbind()),
                 }
             }
             Mode::Multi => {
@@ -567,7 +629,7 @@ impl PyResult_ {
                     let items: Vec<PyItem> = children
                         .iter()
                         .filter(|c| &c.name == name)
-                        .map(|c| PyItem::Element(Source::Owned(bytes[c.start..c.end].to_vec())))
+                        .map(|c| PyItem::Element(Source::Owned(Arc::new(bytes[c.start..c.end].to_vec()))))
                         .collect();
                     let result = Py::new(py, PyResult_::new(items))?;
                     let key = String::from_utf8(name.clone())
@@ -600,14 +662,14 @@ impl PyResult_ {
                 // Borrowed = the original raw input (from `parse(data)`); the
                 // path matches elements at the document root just like
                 // `pygxml.get(data, path)`.
-                // Owned = a captured fragment; descend *into* the fragment's
-                // outer element so `book.get("@id")` reads book's id and
-                // `book.get("title")` finds the inner <title>.
+                // Owned / BorrowedSlice = a captured fragment; descend *into*
+                // the fragment's outer element so `book.get("@id")` reads
+                // book's id and `book.get("title")` finds the inner <title>.
                 let chunk = match src {
-                    Source::Borrowed(_) | Source::BorrowedSlice { .. } => it
+                    Source::Borrowed(_) => it
                         .with_bytes(py, |bytes| engine::run(&prog, bytes))?
                         .map_err(engine_err_to_py)?,
-                    Source::Owned(_) => it
+                    Source::Owned(_) | Source::BorrowedSlice { .. } => it
                         .with_bytes(py, |bytes| engine::run_within(&prog, bytes))?
                         .map_err(engine_err_to_py)?,
                 };
@@ -658,10 +720,10 @@ impl PyResult_ {
                     let prog_refs: Vec<&path::Program> =
                         active.iter().map(|p| p.as_ref()).collect();
                     match src {
-                        Source::Borrowed(_) | Source::BorrowedSlice { .. } => it
+                        Source::Borrowed(_) => it
                             .with_bytes(py, |bytes| run_many(&prog_refs, bytes, false))?
                             .map_err(engine_err_to_py)?,
-                        Source::Owned(_) => it
+                        Source::Owned(_) | Source::BorrowedSlice { .. } => it
                             .with_bytes(py, |bytes| run_many_within(&prog_refs, bytes))?
                             .map_err(engine_err_to_py)?,
                     }
@@ -932,7 +994,7 @@ impl PyResult_ {
                 let mut out: Vec<PyItem> = Vec::new();
                 for c in &children {
                     if c.name.as_slice() == key.as_bytes() {
-                        out.push(PyItem::Element(Source::Owned(bytes[c.start..c.end].to_vec())));
+                        out.push(PyItem::Element(Source::Owned(Arc::new(bytes[c.start..c.end].to_vec()))));
                     }
                 }
                 if out.is_empty() {
@@ -1143,7 +1205,7 @@ impl ResultChildValueIter {
             .children
             .iter()
             .filter(|c| &c.name == name)
-            .map(|c| PyItem::Element(Source::Owned(self.bytes[c.start..c.end].to_vec())))
+            .map(|c| PyItem::Element(Source::Owned(Arc::new(self.bytes[c.start..c.end].to_vec()))))
             .collect();
         Py::new(py, PyResult_::new(items)).map(Some)
     }
@@ -1175,7 +1237,7 @@ impl ResultChildItemIter {
             .children
             .iter()
             .filter(|c| c.name.as_slice() == name_bytes)
-            .map(|c| PyItem::Element(Source::Owned(self.bytes[c.start..c.end].to_vec())))
+            .map(|c| PyItem::Element(Source::Owned(Arc::new(self.bytes[c.start..c.end].to_vec()))))
             .collect();
         let value_result = Py::new(py, PyResult_::new(items))?;
         let key_obj = PyString::new(py, &key_str).into_any();
@@ -1330,14 +1392,19 @@ struct PyPath {
 #[pymethods]
 impl PyPath {
     fn get(&self, py: Python<'_>, data: &Bound<'_, PyString>) -> PyResult<Py<PyResult_>> {
-        let owned: String = data.extract()?;
-        let items = engine::run(&self.program, owned.as_bytes()).map_err(engine_err_to_py)?;
-        Py::new(py, PyResult_::new(lift(items)))
+        // to_cow() is zero-copy for canonical Python strings; element terminals
+        // come back as zero-copy ElementRef ranges resolved against the string.
+        let cow = data.to_cow()?;
+        let items = run_with(&self.program, cow.as_bytes(), true).map_err(engine_err_to_py)?;
+        let source: Py<PyAny> = data.clone().into_any().unbind();
+        Py::new(py, PyResult_::new(lift_with_source(items, &source, py)))
     }
 
     fn get_bytes(&self, py: Python<'_>, data: &Bound<'_, PyBytes>) -> PyResult<Py<PyResult_>> {
-        let items = engine::run(&self.program, data.as_bytes()).map_err(engine_err_to_py)?;
-        Py::new(py, PyResult_::new(lift(items)))
+        // PyBytes is immutable — element terminals are zero-copy ElementRefs.
+        let items = run_with(&self.program, data.as_bytes(), true).map_err(engine_err_to_py)?;
+        let source: Py<PyAny> = data.clone().into_any().unbind();
+        Py::new(py, PyResult_::new(lift_with_source(items, &source, py)))
     }
 
     fn get_buffer(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Py<PyResult_>> {
@@ -1359,9 +1426,13 @@ fn py_get(py: Python<'_>, data: &Bound<'_, PyString>, path: &str) -> PyResult<Py
     }
     let prog = compile_path(path)?;
     // to_cow() is zero-copy for canonical Python strings (UTF-8 internal repr).
+    // Element terminals are zero-copy ElementRef ranges: the string object is
+    // kept alive by the Result and re-borrowed (same cached UTF-8 buffer) on
+    // each access, so the offsets stay valid.
     let cow = data.to_cow()?;
-    let items = engine::run(&prog, cow.as_bytes()).map_err(engine_err_to_py)?;
-    Py::new(py, PyResult_::new(lift(items)))
+    let items = run_with(&prog, cow.as_bytes(), true).map_err(engine_err_to_py)?;
+    let source: Py<PyAny> = data.clone().into_any().unbind();
+    Py::new(py, PyResult_::new(lift_with_source(items, &source, py)))
 }
 
 #[pyfunction]
@@ -1371,8 +1442,10 @@ fn py_get_bytes(py: Python<'_>, data: &Bound<'_, PyBytes>, path: &str) -> PyResu
         return Py::new(py, PyResult_::new(Vec::new()));
     }
     let prog = compile_path(path)?;
-    let items = engine::run(&prog, data.as_bytes()).map_err(engine_err_to_py)?;
-    Py::new(py, PyResult_::new(lift(items)))
+    // PyBytes is immutable — element terminals are zero-copy ElementRefs.
+    let items = run_with(&prog, data.as_bytes(), true).map_err(engine_err_to_py)?;
+    let source: Py<PyAny> = data.clone().into_any().unbind();
+    Py::new(py, PyResult_::new(lift_with_source(items, &source, py)))
 }
 
 #[pyfunction]
@@ -1442,15 +1515,16 @@ fn py_get_many(
         run_many(&prog_refs, cow.as_bytes(), false).map_err(engine_err_to_py)?
     };
     let mut engine_iter = engine_results.drain(..);
+    let mut results: Vec<Py<PyResult_>> = Vec::with_capacity(programs.len());
     for opt in &programs {
         let r = if opt.is_some() {
             Py::new(py, PyResult_::new(lift(engine_iter.next().unwrap())))?
         } else {
             Py::new(py, PyResult_::new(Vec::new()))?
         };
-        list.append(r)?;
+        results.push(r);
     }
-    Ok(list.into())
+    Ok(PyList::new(py, results)?.into())
 }
 
 #[pyfunction]
@@ -1475,15 +1549,16 @@ fn py_get_many_bytes(
         run_many(&prog_refs, data.as_bytes(), true).map_err(engine_err_to_py)?
     };
     let mut engine_iter = engine_results.drain(..);
+    let mut results: Vec<Py<PyResult_>> = Vec::with_capacity(programs.len());
     for opt in &programs {
         let r = if opt.is_some() {
             Py::new(py, PyResult_::new(lift_with_source(engine_iter.next().unwrap(), &source, py)))?
         } else {
             Py::new(py, PyResult_::new(Vec::new()))?
         };
-        list.append(r)?;
+        results.push(r);
     }
-    Ok(list.into())
+    Ok(PyList::new(py, results)?.into())
 }
 
 #[pyfunction]
@@ -1508,15 +1583,16 @@ fn py_get_many_buffer(
             .map_err(engine_err_to_py)?
     };
     let mut engine_iter = engine_results.drain(..);
+    let mut results: Vec<Py<PyResult_>> = Vec::with_capacity(programs.len());
     for opt in &programs {
         let r = if opt.is_some() {
             Py::new(py, PyResult_::new(lift(engine_iter.next().unwrap())))?
         } else {
             Py::new(py, PyResult_::new(Vec::new()))?
         };
-        list.append(r)?;
+        results.push(r);
     }
-    Ok(list.into())
+    Ok(PyList::new(py, results)?.into())
 }
 
 #[pyfunction]

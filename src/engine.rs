@@ -68,19 +68,48 @@ impl core::fmt::Display for EngineError {
     }
 }
 
+/// Per-run flags threaded through the single-program evaluator.
+#[derive(Clone, Copy, Default)]
+struct RunCtx {
+    /// Emit `Item::ElementRef` (zero-copy byte range into the run's input)
+    /// instead of `Item::Element(to_vec())` for element terminals. Only valid
+    /// when the offsets refer to the original input (not a local fragment).
+    borrowable: bool,
+    /// Stop the scan as soon as any item has been emitted. Set when the
+    /// program's first modifier is `@first` — later modifiers then operate on
+    /// the same single-item list they would have seen after truncation.
+    stop_first: bool,
+}
+
+/// True when the program's result is fully determined by its first item.
+fn stops_after_first(program: &Program) -> bool {
+    matches!(program.modifiers.first(), Some(Modifier::First))
+}
+
 pub fn run(program: &Program, xml: &[u8]) -> Result<Vec<Item>, EngineError> {
+    run_with(program, xml, false)
+}
+
+/// Like `run`, but with `borrowable = true` element terminals are emitted as
+/// `Item::ElementRef` byte ranges into `xml` (the caller must keep `xml` alive
+/// and resolve the refs, e.g. via `lift_with_source`).
+pub fn run_with(program: &Program, xml: &[u8], borrowable: bool) -> Result<Vec<Item>, EngineError> {
     let mut out: Vec<Item> = Vec::new();
     if !program.steps.is_empty() {
+        let ctx = RunCtx {
+            borrowable,
+            stop_first: stops_after_first(program),
+        };
         let mut reader = Reader::from_reader(xml);
         reader.config_mut().trim_text(false);
         reader.config_mut().expand_empty_elements = false;
         reader.config_mut().check_end_names = false;
-        match enter(&mut reader, xml, None, &program.steps, &mut out) {
+        match enter(&mut reader, xml, None, &program.steps, &mut out, ctx) {
             Ok(()) | Err(EngineError::Done) => {}
             Err(e) => return Err(e),
         }
     }
-    apply_modifiers(&program.modifiers, &mut out);
+    apply_modifiers(&program.modifiers, &mut out, xml);
     Ok(out)
 }
 
@@ -140,31 +169,34 @@ pub fn run_within(program: &Program, fragment: &[u8]) -> Result<Vec<Item>, Engin
             Err(e) => return Err(e),
         }
     }
-    apply_modifiers(&program.modifiers, &mut out);
+    apply_modifiers(&program.modifiers, &mut out, fragment);
     Ok(out)
 }
 
 /// Extract the textual representation of an item — text content for elements,
-/// the raw bytes for scalars. Used by the `Unique` modifier and in tests.
-pub fn item_text(item: &Item) -> Vec<u8> {
+/// the raw bytes for scalars. `input` is the byte slice the run was executed
+/// against; it resolves `Item::ElementRef` ranges. Used by the `Unique`
+/// modifier and in tests.
+pub fn item_text(item: &Item, input: &[u8]) -> Vec<u8> {
     match item {
         Item::Scalar(v) | Item::Text(v) => v.clone(),
         Item::Element(frag) => extract_element_text(frag),
-        // ElementRef bytes must be resolved by the caller before calling item_text.
-        // This path is only reachable if ElementRef escapes the engine without being
-        // resolved in lift(); treat it as empty to avoid a panic.
-        Item::ElementRef { .. } => Vec::new(),
+        Item::ElementRef { start, end } => {
+            extract_element_text(&input[*start as usize..*end as usize])
+        }
     }
 }
 
 /// Borrow the raw bytes of an item without allocating for Text/Scalar variants.
 /// Element variants fall back to extract_element_text (allocates). Use in hot
 /// comparison or aggregation loops where items are expected to be Text/Scalar.
-fn item_bytes_for_cmp(item: &Item) -> std::borrow::Cow<'_, [u8]> {
+fn item_bytes_for_cmp<'a>(item: &'a Item, input: &[u8]) -> std::borrow::Cow<'a, [u8]> {
     match item {
         Item::Scalar(v) | Item::Text(v) => std::borrow::Cow::Borrowed(v.as_slice()),
         Item::Element(frag) => std::borrow::Cow::Owned(extract_element_text(frag)),
-        Item::ElementRef { .. } => std::borrow::Cow::Borrowed(&[]),
+        Item::ElementRef { start, end } => std::borrow::Cow::Owned(extract_element_text(
+            &input[*start as usize..*end as usize],
+        )),
     }
 }
 
@@ -183,11 +215,11 @@ pub fn extract_element_text(fragment: &[u8]) -> Vec<u8> {
     }
 }
 
-fn collapse_numeric(out: &mut Vec<Item>, agg: impl FnOnce(&[f64]) -> f64) {
+fn collapse_numeric(out: &mut Vec<Item>, input: &[u8], agg: impl FnOnce(&[f64]) -> f64) {
     let nums: Vec<f64> = out
         .iter()
         .filter_map(|it| {
-            let bytes = item_bytes_for_cmp(it);
+            let bytes = item_bytes_for_cmp(it, input);
             std::str::from_utf8(bytes.as_ref()).ok().and_then(|s| s.trim().parse::<f64>().ok())
         })
         .collect();
@@ -203,7 +235,7 @@ fn collapse_numeric(out: &mut Vec<Item>, agg: impl FnOnce(&[f64]) -> f64) {
     out.push(Item::Scalar(s.into_bytes()));
 }
 
-fn apply_modifiers(modifiers: &[Modifier], out: &mut Vec<Item>) {
+fn apply_modifiers(modifiers: &[Modifier], out: &mut Vec<Item>, input: &[u8]) {
     for m in modifiers {
         match m {
             Modifier::Reverse => out.reverse(),
@@ -221,46 +253,46 @@ fn apply_modifiers(modifiers: &[Modifier], out: &mut Vec<Item>) {
                 out.push(Item::Scalar(n.to_string().into_bytes()));
             }
             Modifier::Sort => {
-                out.sort_by(|a, b| item_bytes_for_cmp(a).cmp(&item_bytes_for_cmp(b)));
+                out.sort_by(|a, b| item_bytes_for_cmp(a, input).cmp(&item_bytes_for_cmp(b, input)));
             }
             Modifier::SortNumeric => {
                 out.sort_by(|a, b| {
-                    let pa = parse_item_number(a);
-                    let pb = parse_item_number(b);
+                    let pa = parse_item_number(a, input);
+                    let pb = parse_item_number(b, input);
                     match (pa, pb) {
                         (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
                         (Some(_), None) => std::cmp::Ordering::Less,
                         (None, Some(_)) => std::cmp::Ordering::Greater,
-                        (None, None) => item_bytes_for_cmp(a).cmp(&item_bytes_for_cmp(b)),
+                        (None, None) => item_bytes_for_cmp(a, input).cmp(&item_bytes_for_cmp(b, input)),
                     }
                 });
             }
             Modifier::Unique => {
                 let mut seen = std::collections::HashSet::new();
-                out.retain(|it| seen.insert(item_text(it)));
+                out.retain(|it| seen.insert(item_text(it, input)));
             }
             // No-ops kept for gjson-syntax compatibility.
             Modifier::Flatten | Modifier::Tostr => {}
-            Modifier::Sum => collapse_numeric(out, |xs| xs.iter().sum()),
-            Modifier::Avg => collapse_numeric(out, |xs| {
+            Modifier::Sum => collapse_numeric(out, input, |xs| xs.iter().sum()),
+            Modifier::Avg => collapse_numeric(out, input, |xs| {
                 if xs.is_empty() {
                     f64::NAN
                 } else {
                     xs.iter().sum::<f64>() / xs.len() as f64
                 }
             }),
-            Modifier::Min => collapse_numeric(out, |xs| {
+            Modifier::Min => collapse_numeric(out, input, |xs| {
                 xs.iter().cloned().fold(f64::INFINITY, f64::min)
             }),
-            Modifier::Max => collapse_numeric(out, |xs| {
+            Modifier::Max => collapse_numeric(out, input, |xs| {
                 xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
             }),
         }
     }
 }
 
-fn parse_item_number(it: &Item) -> Option<f64> {
-    let bytes = item_bytes_for_cmp(it);
+fn parse_item_number(it: &Item, input: &[u8]) -> Option<f64> {
+    let bytes = item_bytes_for_cmp(it, input);
     std::str::from_utf8(bytes.as_ref()).ok().and_then(|s| s.trim().parse::<f64>().ok())
 }
 
@@ -270,6 +302,7 @@ fn enter<'i>(
     current: Option<&BytesStart<'_>>,
     steps: &[Step],
     out: &mut Vec<Item>,
+    ctx: RunCtx,
 ) -> Result<(), EngineError> {
     if let Some(Step::Attribute(name)) = steps.first() {
         if let Some(start) = current {
@@ -317,15 +350,19 @@ fn enter<'i>(
     let mut count: usize = 0;
 
     loop {
+        // `@first`-style early stop: any emitted item completes the program.
+        if ctx.stop_first && !out.is_empty() {
+            return Err(EngineError::Done);
+        }
         let pos_before = reader.buffer_position() as usize;
         match reader.read_event() {
             Ok(Event::Start(child)) => {
-                // qn_raw borrows from `input` (slice-backed reader: no copy).
+                // qn_raw and `child` itself borrow from `input` (slice-backed
+                // reader), so the event can be used directly with no copy.
                 let qn_raw = child.name().into_inner();
                 let local_raw = local_name_bytes(qn_raw);
                 if name.matches_bytes(qn_raw, local_raw) {
                     count += 1;
-                    let owned = child.into_owned();
                     if auto_check {
                         if auto_matched {
                             return Err(EngineError::AmbiguousMatch {
@@ -333,17 +370,18 @@ fn enter<'i>(
                             });
                         }
                         auto_matched = true;
-                        descend_or_capture(reader, input, &owned, rest, out, pos_before)?;
+                        descend_or_capture(reader, input, &child, rest, out, pos_before, ctx)?;
                     } else {
                         if let Some(emitted) = handle_match_start(
                             reader,
                             input,
-                            owned,
+                            &child,
                             &index,
                             count,
                             rest,
                             out,
                             pos_before,
+                            ctx,
                         )? {
                             if emitted && single_shot {
                                 return Err(EngineError::Done);
@@ -355,8 +393,7 @@ fn enter<'i>(
                     // inside this child's subtree. Pass the same `steps` so
                     // the search continues at deeper levels. Descendant target
                     // is always `Each` — never short-circuits, never errors.
-                    let owned = child.into_owned();
-                    enter(reader, input, Some(&owned), steps, out)?;
+                    enter(reader, input, Some(&child), steps, out, ctx)?;
                 } else {
                     // qn_raw borrows from input (not from a temporary buf),
                     // so it can be passed directly to read_to_end.
@@ -368,7 +405,6 @@ fn enter<'i>(
                 let local_raw = local_name_bytes(qn_raw);
                 if name.matches_bytes(qn_raw, local_raw) {
                     count += 1;
-                    let owned = child.into_owned();
                     if auto_check {
                         if auto_matched {
                             return Err(EngineError::AmbiguousMatch {
@@ -376,10 +412,10 @@ fn enter<'i>(
                             });
                         }
                         auto_matched = true;
-                        handle_match_empty(&owned, &index, count, rest, out)?;
+                        handle_match_empty(&child, &index, count, rest, out)?;
                     } else {
                         let emitted =
-                            handle_match_empty(&owned, &index, count, rest, out)?;
+                            handle_match_empty(&child, &index, count, rest, out)?;
                         if emitted && single_shot {
                             return Err(EngineError::Done);
                         }
@@ -408,17 +444,28 @@ fn descend_or_capture<'i>(
     rest: &[Step],
     out: &mut Vec<Item>,
     pos_before: usize,
+    ctx: RunCtx,
 ) -> Result<bool, EngineError> {
     let qn_bytes = child.name().into_inner();
     if rest.is_empty() {
         let _ = reader.read_to_end(quick_xml::name::QName(qn_bytes));
         let pos_after = reader.buffer_position() as usize;
-        out.push(Item::Element(input[pos_before..pos_after].to_vec()));
+        out.push(capture_element(input, pos_before, pos_after, ctx.borrowable));
         Ok(true)
     } else {
         let prev_len = out.len();
-        enter(reader, input, Some(child), rest, out)?;
+        enter(reader, input, Some(child), rest, out, ctx)?;
         Ok(out.len() > prev_len)
+    }
+}
+
+/// Element-terminal capture: zero-copy byte range when the caller guarantees
+/// the input outlives the items (`borrowable`), owned bytes otherwise.
+fn capture_element(input: &[u8], start: usize, end: usize, borrowable: bool) -> Item {
+    if borrowable {
+        Item::ElementRef { start: start as u32, end: end as u32 }
+    } else {
+        Item::Element(input[start..end].to_vec())
     }
 }
 
@@ -429,12 +476,13 @@ fn descend_or_capture<'i>(
 fn handle_match_start<'i>(
     reader: &mut Reader<&'i [u8]>,
     input: &'i [u8],
-    child: BytesStart<'static>,
+    child: &BytesStart<'i>,
     index: &ChildIndex,
     count: usize,
     rest: &[Step],
     out: &mut Vec<Item>,
     pos_before: usize,
+    ctx: RunCtx,
 ) -> Result<Option<bool>, EngineError> {
     let qn_bytes = child.name().into_inner();
     match index {
@@ -443,13 +491,13 @@ fn handle_match_start<'i>(
             // ambiguity check only applies when there are follow-on steps,
             // and that path is handled by `enter`'s deferred branch.
             Ok(Some(descend_or_capture(
-                reader, input, &child, rest, out, pos_before,
+                reader, input, child, rest, out, pos_before, ctx,
             )?))
         }
         ChildIndex::Nth(n) => {
             if count == n + 1 {
                 Ok(Some(descend_or_capture(
-                    reader, input, &child, rest, out, pos_before,
+                    reader, input, child, rest, out, pos_before, ctx,
                 )?))
             } else {
                 let _ = reader.read_to_end(quick_xml::name::QName(qn_bytes));
@@ -458,7 +506,7 @@ fn handle_match_start<'i>(
         }
         ChildIndex::Each => {
             Ok(Some(descend_or_capture(
-                reader, input, &child, rest, out, pos_before,
+                reader, input, child, rest, out, pos_before, ctx,
             )?))
         }
         ChildIndex::Count => {
@@ -470,19 +518,37 @@ fn handle_match_start<'i>(
             // evaluated directly against the start tag, with no need to
             // capture or re-parse the subtree.
             if let Some(attr_name) = filter.attr_only.as_deref() {
-                let pred_value = read_attr_str(&child, attr_name);
+                let pred_value = read_attr_str(child, attr_name);
                 let pred_passes = match pred_value {
                     Some(s) => compare(&s, &filter.op, &filter.value),
                     None => false,
                 };
                 if pred_passes {
                     Ok(Some(descend_or_capture(
-                        reader, input, &child, rest, out, pos_before,
+                        reader, input, child, rest, out, pos_before, ctx,
                     )?))
                 } else {
                     let _ = reader.read_to_end(quick_xml::name::QName(qn_bytes));
                     Ok(Some(false))
                 }
+            } else if simple_child_filter(filter).is_some() && stream_rest_supported(rest) {
+                // Single-pass path: evaluate the direct-child predicate and
+                // collect the rest terminal in one walk over the live reader —
+                // no fragment capture, no re-parse of the subtree.
+                let pred_name = simple_child_filter(filter).unwrap();
+                let passed = stream_filter_scope(
+                    reader,
+                    input,
+                    child,
+                    pred_name,
+                    filter,
+                    rest,
+                    pos_before,
+                    TerminalShape::Element,
+                    ctx.borrowable,
+                    out,
+                )?;
+                Ok(Some(passed))
             } else {
                 // General path: capture the candidate's bytes <e>...</e>
                 // and run the predicate + remaining-path on the fragment.
@@ -575,8 +641,9 @@ fn apply_within_fragment(
     loop {
         match reader.read_event() {
             Ok(Event::Start(start)) => {
-                let owned = start.into_owned();
-                match enter(&mut reader, fragment, Some(&owned), inner_steps, out) {
+                // Fragment-local offsets are not valid ElementRefs → default
+                // (non-borrowable) ctx.
+                match enter(&mut reader, fragment, Some(&start), inner_steps, out, RunCtx::default()) {
                     Ok(()) | Err(EngineError::Done) => {}
                     Err(e) => return Err(e),
                 }
@@ -626,7 +693,7 @@ fn eval_filter(fragment: &[u8], filter: &Filter) -> Result<bool, EngineError> {
     let mut values: Vec<Item> = Vec::new();
     apply_within_fragment(fragment, &filter.path, &mut values)?;
     let value_bytes = match values.first() {
-        Some(item) => item_text(item),
+        Some(item) => item_text(item, fragment),
         None => return Ok(false),
     };
     let value_str = std::str::from_utf8(&value_bytes).unwrap_or("");
@@ -808,6 +875,164 @@ fn eval_simple_child_filter_and_collect(
     }
 }
 
+/// Rest shapes `stream_filter_scope` can evaluate without a fragment re-parse:
+/// empty (the candidate element itself is the result), a single non-descendant
+/// child step with a plain selector, or a single attribute terminal.
+fn stream_rest_supported(rest: &[Step]) -> bool {
+    match rest {
+        [] => true,
+        [Step::Attribute(_)] => true,
+        [Step::Child { descendant: false, index, .. }] => matches!(
+            index,
+            ChildIndex::Auto | ChildIndex::Each | ChildIndex::Nth(_)
+        ),
+        _ => false,
+    }
+}
+
+/// Single-pass filter evaluation on the live reader. Called just after the
+/// candidate's Start tag was consumed; reads events through the candidate's
+/// End tag exactly once. Looks for the first direct child matching `pred_name`
+/// (its text is the predicate value; a missing predicate child fails the
+/// filter) while buffering rest-terminal matches, then emits the buffer iff
+/// the predicate passes. Replaces the capture + double re-parse of the
+/// fragment path for the common `e.#(child op value)` filters.
+#[allow(clippy::too_many_arguments)]
+fn stream_filter_scope<'i>(
+    reader: &mut Reader<&'i [u8]>,
+    input: &'i [u8],
+    candidate: &BytesStart<'i>,
+    pred_name: &NameMatcher,
+    filter: &Filter,
+    rest: &[Step],
+    pos_before: usize,
+    shape: TerminalShape,
+    borrowable: bool,
+    out: &mut Vec<Item>,
+) -> Result<bool, EngineError> {
+    let (rest_child, rest_attr) = match rest {
+        [Step::Child { name, index, .. }] => (Some((name, index)), None),
+        [Step::Attribute(name)] => (None, Some(name.as_str())),
+        _ => (None, None),
+    };
+
+    let mut pred_text: Option<Vec<u8>> = None;
+    let mut buffered: Vec<Item> = Vec::new();
+    let mut rest_count: usize = 0;
+
+    loop {
+        let pos_c = reader.buffer_position() as usize;
+        match reader.read_event() {
+            Ok(Event::Start(c)) => {
+                let raw = c.name().into_inner();
+                let local = local_name_bytes(raw);
+                let is_pred = pred_text.is_none() && pred_name.matches_bytes(raw, local);
+                let rest_take = match rest_child {
+                    Some((rname, ridx)) if rname.matches_bytes(raw, local) => {
+                        rest_count += 1;
+                        match ridx {
+                            ChildIndex::Auto | ChildIndex::Each => true,
+                            ChildIndex::Nth(n) => rest_count == n + 1,
+                            _ => false,
+                        }
+                    }
+                    _ => false,
+                };
+                if is_pred {
+                    let text = read_text_in_scope(reader);
+                    if rest_take {
+                        let pos_after = reader.buffer_position() as usize;
+                        buffered.push(match shape {
+                            TerminalShape::Text => Item::Text(text.clone()),
+                            TerminalShape::Count => Item::Scalar(Vec::new()),
+                            TerminalShape::Element => {
+                                capture_element(input, pos_c, pos_after, borrowable)
+                            }
+                        });
+                    }
+                    pred_text = Some(text);
+                } else if rest_take {
+                    match shape {
+                        TerminalShape::Text => {
+                            buffered.push(Item::Text(read_text_in_scope(reader)));
+                        }
+                        TerminalShape::Count => {
+                            let _ = reader.read_to_end(quick_xml::name::QName(raw));
+                            buffered.push(Item::Scalar(Vec::new()));
+                        }
+                        TerminalShape::Element => {
+                            let _ = reader.read_to_end(quick_xml::name::QName(raw));
+                            let pos_after = reader.buffer_position() as usize;
+                            buffered.push(capture_element(input, pos_c, pos_after, borrowable));
+                        }
+                    }
+                } else {
+                    let _ = reader.read_to_end(quick_xml::name::QName(raw));
+                }
+            }
+            Ok(Event::Empty(c)) => {
+                let raw = c.name().into_inner();
+                let local = local_name_bytes(raw);
+                if pred_text.is_none() && pred_name.matches_bytes(raw, local) {
+                    // Empty element → empty predicate text.
+                    pred_text = Some(Vec::new());
+                }
+                if let Some((rname, ridx)) = rest_child {
+                    if rname.matches_bytes(raw, local) {
+                        rest_count += 1;
+                        let take = match ridx {
+                            ChildIndex::Auto | ChildIndex::Each => true,
+                            ChildIndex::Nth(n) => rest_count == n + 1,
+                            _ => false,
+                        };
+                        if take {
+                            let pos_after = reader.buffer_position() as usize;
+                            buffered.push(match shape {
+                                TerminalShape::Text => Item::Text(Vec::new()),
+                                TerminalShape::Count => Item::Scalar(Vec::new()),
+                                // `<tag …/>` is literally present in the input,
+                                // so the byte range is a valid fragment.
+                                TerminalShape::Element => {
+                                    capture_element(input, pos_c, pos_after, borrowable)
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+            Ok(Event::End(_)) | Ok(Event::Eof) => break,
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+
+    let passed = match &pred_text {
+        Some(text) => {
+            let raw = std::str::from_utf8(text).unwrap_or("");
+            compare(raw, &filter.op, &filter.value)
+        }
+        None => false,
+    };
+    if !passed {
+        return Ok(false);
+    }
+
+    if rest.is_empty() {
+        let pos_after = reader.buffer_position() as usize;
+        out.push(match shape {
+            TerminalShape::Count => Item::Scalar(Vec::new()),
+            _ => capture_element(input, pos_before, pos_after, borrowable),
+        });
+    } else if let Some(attr_name) = rest_attr {
+        if let Some(val) = read_attr(candidate, attr_name) {
+            out.push(Item::Scalar(val));
+        }
+    } else {
+        out.extend(buffered);
+    }
+    Ok(true)
+}
+
 fn compare(raw: &str, op: &FilterOp, target: &FilterValue) -> bool {
     match op {
         FilterOp::Eq => match target {
@@ -970,9 +1195,34 @@ impl ProgState {
     }
 }
 
-/// `borrowable`: when true the engine emits `Item::ElementRef` instead of
-/// `Item::Element(to_vec())` for Element-shape terminals. The caller must
-/// resolve the refs back to `&xml[start..end]` slices via `lift_with_source`.
+/// Immutable per-run settings for the multi-program engine, shared by every
+/// recursion frame of `scan_many_children`.
+struct ManyCtx<'p> {
+    programs: &'p [&'p Program],
+    /// Per-program: result is fully determined by its first item (`|@first`).
+    /// Such a program is skipped once its out list is non-empty; when *every*
+    /// program is first_only and has emitted, the whole scan stops early.
+    first_only: Vec<bool>,
+    all_first_only: bool,
+    /// Emit `Item::ElementRef` instead of `Item::Element(to_vec())` for
+    /// Element-shape terminals. The caller must resolve the refs back to
+    /// `&xml[start..end]` slices via `lift_with_source`.
+    borrowable: bool,
+}
+
+impl<'p> ManyCtx<'p> {
+    fn new(programs: &'p [&'p Program], borrowable: bool) -> Self {
+        let first_only: Vec<bool> = programs.iter().map(|p| stops_after_first(p)).collect();
+        let all_first_only = !programs.is_empty() && first_only.iter().all(|&b| b);
+        ManyCtx { programs, first_only, all_first_only, borrowable }
+    }
+
+    /// Program `id` can emit nothing new (first_only and already has output).
+    fn prog_done(&self, id: usize, outs: &[Vec<Item>]) -> bool {
+        self.first_only[id] && !outs[id].is_empty()
+    }
+}
+
 pub fn run_many(
     programs: &[&Program],
     xml: &[u8],
@@ -986,6 +1236,7 @@ pub fn run_many(
 
     let non_empty: Vec<usize> = (0..n).filter(|&i| !programs[i].steps.is_empty()).collect();
     if !non_empty.is_empty() {
+        let mctx = ManyCtx::new(programs, borrowable);
         let mut reader = Reader::from_reader(xml);
         reader.config_mut().trim_text(false);
         reader.config_mut().expand_empty_elements = false;
@@ -998,11 +1249,14 @@ pub fn run_many(
             .collect();
 
         // Scan at document root level (no enclosing element, scoped=false).
-        scan_many_children(&mut reader, xml, None, programs, &mut states, &mut outs, borrowable)?;
+        match scan_many_children(&mut reader, xml, None, &mctx, &mut states, &mut outs) {
+            Ok(()) | Err(EngineError::Done) => {}
+            Err(e) => return Err(e),
+        }
     }
 
     for i in 0..n {
-        apply_modifiers(&programs[i].modifiers, &mut outs[i]);
+        apply_modifiers(&programs[i].modifiers, &mut outs[i], xml);
     }
     Ok(outs)
 }
@@ -1019,6 +1273,8 @@ pub fn run_many_within(
 
     let non_empty: Vec<usize> = (0..n).filter(|&i| !programs[i].steps.is_empty()).collect();
     if !non_empty.is_empty() {
+        // ElementRef not valid — fragment is a local slice.
+        let mctx = ManyCtx::new(programs, false);
         let mut reader = Reader::from_reader(fragment);
         reader.config_mut().trim_text(false);
         reader.config_mut().expand_empty_elements = false;
@@ -1035,15 +1291,17 @@ pub fn run_many_within(
                 Ok(Event::Start(start)) => {
                     // Handle Attr/Text terminals that target the outer element.
                     collect_many_attr_text(Some(&start), programs, &mut states, &mut outs);
-                    scan_many_children(
+                    match scan_many_children(
                         &mut reader,
                         fragment,
                         Some(&start),
-                        programs,
+                        &mctx,
                         &mut states,
                         &mut outs,
-                        false, // ElementRef not valid — fragment is a local slice
-                    )?;
+                    ) {
+                        Ok(()) | Err(EngineError::Done) => {}
+                        Err(e) => return Err(e),
+                    }
                     break;
                 }
                 Ok(Event::Empty(start)) => {
@@ -1058,7 +1316,7 @@ pub fn run_many_within(
     }
 
     for i in 0..n {
-        apply_modifiers(&programs[i].modifiers, &mut outs[i]);
+        apply_modifiers(&programs[i].modifiers, &mut outs[i], fragment);
     }
     Ok(outs)
 }
@@ -1108,11 +1366,11 @@ fn scan_many_children<'i>(
     reader: &mut Reader<&'i [u8]>,
     input: &'i [u8],
     current: Option<&BytesStart<'_>>,
-    programs: &[&Program],
+    mctx: &ManyCtx<'_>,
     states: &mut Vec<ProgState>,
     outs: &mut Vec<Vec<Item>>,
-    borrowable: bool,
 ) -> Result<(), EngineError> {
+    let programs = mctx.programs;
     if states.is_empty() {
         consume_to_end(reader, current.is_some());
         return Ok(());
@@ -1128,18 +1386,24 @@ fn scan_many_children<'i>(
     }
 
     loop {
+        // All programs are `@first`-determined and have emitted: nothing new
+        // can be produced anywhere — unwind the whole scan (caught by
+        // run_many / run_many_within, like `EngineError::Done` in `run`).
+        if mctx.all_first_only && outs.iter().all(|o| !o.is_empty()) {
+            return Err(EngineError::Done);
+        }
         let pos_before = reader.buffer_position() as usize;
         match reader.read_event() {
             Ok(Event::Start(child)) => {
                 process_many_start(
                     reader, input, child,
-                    pos_before, programs, states, outs, borrowable,
+                    pos_before, mctx, states, outs,
                 )?;
             }
             Ok(Event::Empty(child)) => {
                 process_many_empty(
                     child,
-                    programs, states, outs,
+                    mctx, states, outs,
                 )?;
             }
             Ok(Event::End(_)) | Ok(Event::Eof) => {
@@ -1163,11 +1427,12 @@ fn process_many_start<'i>(
     input: &'i [u8],
     child: BytesStart<'i>,
     pos_before: usize,
-    programs: &[&Program],
+    mctx: &ManyCtx<'_>,
     states: &mut Vec<ProgState>,
     outs: &mut Vec<Vec<Item>>,
-    borrowable: bool,
 ) -> Result<(), EngineError> {
+    let programs = mctx.programs;
+    let borrowable = mctx.borrowable;
     let qn_bytes: &[u8] = child.name().into_inner();
     // A3: compute local once from raw bytes; avoid per-program UTF-8 decoding.
     let local = local_name_bytes(qn_bytes);
@@ -1185,7 +1450,7 @@ fn process_many_start<'i>(
     // A2: SmallVec avoids heap allocation for the typical case (≤16 programs).
     let mut actions: SmallVec<[Action; 16]> = SmallVec::new();
     for s in states.iter_mut() {
-        if s.done_in_scope {
+        if s.done_in_scope || mctx.prog_done(s.id, outs) {
             actions.push(Action::Skip);
             continue;
         }
@@ -1293,6 +1558,49 @@ fn process_many_start<'i>(
         return Ok(());
     }
 
+    // Streaming filter fast path: exactly one program wants this element and
+    // it is a simple-child filter — evaluate predicate + rest terminal in a
+    // single walk over the live reader instead of read_to_end + fragment
+    // re-parse. Only taken when no other program needs the subtree.
+    if !needs_actual_descent {
+        let mut cf_iter = actions.iter().zip(states.iter_mut()).filter_map(|(a, s)| match a {
+            Action::CaptureFilter { filter_cursor, rest_start } => {
+                Some((s, *filter_cursor, *rest_start))
+            }
+            Action::EmitTerminal => Some((s, usize::MAX, usize::MAX)), // sentinel: disqualifies
+            _ => None,
+        });
+        if let Some((s, filter_cursor, rest_start)) = cf_iter.next() {
+            let exclusive = filter_cursor != usize::MAX && cf_iter.next().is_none();
+            if exclusive {
+                let filter = match &programs[s.id].steps[filter_cursor] {
+                    Step::Child { index: ChildIndex::FilterFirst(f), .. }
+                    | Step::Child { index: ChildIndex::FilterAll(f), .. } => Some(f),
+                    _ => None,
+                };
+                if let Some(filter) = filter {
+                    let rest = &programs[s.id].steps[rest_start..];
+                    let shape = programs[s.id].terminal_shape;
+                    if filter.attr_only.is_none()
+                        && stream_rest_supported(rest)
+                        && !(rest.is_empty() && shape == TerminalShape::Text)
+                    {
+                        if let Some(pred_name) = simple_child_filter(filter) {
+                            let passed = stream_filter_scope(
+                                reader, input, &child, pred_name, filter, rest,
+                                pos_before, shape, borrowable, &mut outs[s.id],
+                            )?;
+                            if passed && s.single_shot {
+                                s.done_in_scope = true;
+                            }
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Count-shape EmitTerminals don't need the fragment bytes; only Element/Text
     // shapes and CaptureFilter need pos_after/fragment.
     let needs_bytes = actions.iter().zip(states.iter()).any(|(a, s)| match a {
@@ -1321,7 +1629,7 @@ fn process_many_start<'i>(
                 }
             }
             collect_many_attr_text(Some(&child), programs, &mut child_states, outs);
-            scan_many_children(reader, input, Some(&child), programs, &mut child_states, outs, borrowable)?;
+            scan_many_children(reader, input, Some(&child), mctx, &mut child_states, outs)?;
         } else {
             let _ = reader.read_to_end(quick_xml::name::QName(qn_bytes));
         }
@@ -1417,17 +1725,18 @@ fn process_many_start<'i>(
 /// Process one Empty event against all active programs.
 fn process_many_empty<'i>(
     child: BytesStart<'i>,
-    programs: &[&Program],
+    mctx: &ManyCtx<'_>,
     states: &mut Vec<ProgState>,
     outs: &mut Vec<Vec<Item>>,
 ) -> Result<(), EngineError> {
+    let programs = mctx.programs;
     let qn_bytes: &[u8] = child.name().into_inner();
     // A3: byte-based local name; A4: serialize_empty only when actually needed.
     let local = local_name_bytes(qn_bytes);
     let mut frag: Option<Vec<u8>> = None;
 
     for s in states.iter_mut() {
-        if s.done_in_scope {
+        if s.done_in_scope || mctx.prog_done(s.id, outs) {
             continue;
         }
         let steps = &programs[s.id].steps[s.cursor..];
@@ -1507,7 +1816,7 @@ mod tests {
         run(&prog, xml)
             .expect("run should succeed")
             .iter()
-            .map(|it| String::from_utf8_lossy(&item_text(it)).into_owned())
+            .map(|it| String::from_utf8_lossy(&item_text(it, xml)).into_owned())
             .collect()
     }
 
