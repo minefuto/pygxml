@@ -790,6 +790,21 @@ impl PyResult_ {
         Py::new(py, ResultItemsView { parent })
     }
 
+    /// Return a view of the dict-mode Result's `(name, value_Result)` pairs for
+    /// every direct child element, in document order. Unlike `items()`, repeated
+    /// tag names are not collapsed: each child element yields its own pair.
+    fn children(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<ResultChildrenView>> {
+        let mode = slf.mode(py)?;
+        if mode != Mode::DictElement {
+            return Err(PyTypeError::new_err(format!(
+                "Result.children() requires a dict-like Result (single element with children); got {}",
+                mode_label(mode)
+            )));
+        }
+        let parent: Py<Self> = slf.into();
+        Py::new(py, ResultChildrenView { parent })
+    }
+
     fn __bool__(&self, py: Python<'_>) -> PyResult<bool> {
         let val = self.value(py)?;
         val.bind(py).is_truthy()
@@ -1247,6 +1262,42 @@ impl ResultChildItemIter {
     }
 }
 
+/// Yields `(name_str, value_Result)` for every direct child element in document
+/// order. Unlike `ResultChildItemIter`, repeated tag names are not collapsed:
+/// each child element produces its own pair, so the interleaving of differently
+/// named siblings is preserved.
+#[pyclass(name = "ResultChildIter", module = "pygxml._pygxml")]
+struct ResultChildIter {
+    bytes: Vec<u8>,
+    children: Vec<ChildSpan>,
+    cursor: usize,
+}
+
+#[pymethods]
+impl ResultChildIter {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        if self.cursor >= self.children.len() {
+            return Ok(None);
+        }
+        let child = &self.children[self.cursor];
+        self.cursor += 1;
+        let name_str =
+            String::from_utf8(child.name.clone()).expect("XML tag names are valid UTF-8");
+        let item = PyItem::Element(Source::Owned(Arc::new(
+            self.bytes[child.start..child.end].to_vec(),
+        )));
+        let value_result = Py::new(py, PyResult_::new(vec![item]))?;
+        let name_obj = PyString::new(py, &name_str).into_any();
+        let value_obj = value_result.into_bound(py).into_any();
+        let tuple = PyTuple::new(py, &[name_obj, value_obj])?;
+        Ok(Some(tuple.into_any().unbind()))
+    }
+}
+
 // ---- View objects ----------------------------------------------------------
 
 /// dict.keys()-like view over a DictElement Result. Re-iterable; each call to
@@ -1378,6 +1429,44 @@ impl ResultItemsView {
 
     fn __repr__(&self) -> String {
         "result_items([...])".to_string()
+    }
+}
+
+/// Order-preserving view over every direct child element of a DictElement
+/// Result. Re-iterable; each call to `__iter__` produces a fresh, lazy iterator.
+#[pyclass(name = "ResultChildrenView", module = "pygxml._pygxml", frozen)]
+struct ResultChildrenView {
+    parent: Py<PyResult_>,
+}
+
+#[pymethods]
+impl ResultChildrenView {
+    fn __iter__(&self, py: Python<'_>) -> PyResult<Py<ResultChildIter>> {
+        let parent = self.parent.get();
+        let bytes = parent
+            .dict_element_bytes(py)?
+            .expect("DictElement mode implies element bytes are available");
+        let children = collect_direct_children(&bytes);
+        Py::new(
+            py,
+            ResultChildIter {
+                bytes,
+                children,
+                cursor: 0,
+            },
+        )
+    }
+
+    fn __len__(&self, py: Python<'_>) -> PyResult<usize> {
+        let parent = self.parent.get();
+        let bytes = parent
+            .dict_element_bytes(py)?
+            .expect("DictElement mode implies element bytes are available");
+        Ok(collect_direct_children(&bytes).len())
+    }
+
+    fn __repr__(&self) -> String {
+        "result_children([...])".to_string()
     }
 }
 
@@ -1623,8 +1712,10 @@ fn _pygxml(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ResultChildKeyIter>()?;
     m.add_class::<ResultChildValueIter>()?;
     m.add_class::<ResultChildItemIter>()?;
+    m.add_class::<ResultChildIter>()?;
     m.add_class::<ResultKeysView>()?;
     m.add_class::<ResultValuesView>()?;
     m.add_class::<ResultItemsView>()?;
+    m.add_class::<ResultChildrenView>()?;
     Ok(())
 }

@@ -350,6 +350,96 @@ def test_items_view_unique_with_duplicates():
     assert len(book_value) == 3
 
 
+# ---- children (order-preserving, duplicates kept) ---------------------------
+
+INTERLEAVED = b"""<?xml version="1.0"?>
+<vrrp-interface>
+  <vrrp-vlan><unit>1</unit></vrrp-vlan>
+  <interface-state>up</interface-state>
+  <vrrp-mode>active</vrrp-mode>
+  <vrrp-vlan><unit>2</unit></vrrp-vlan>
+  <interface-state>down</interface-state>
+  <active-inherit><vrrp-mode>inherit</vrrp-mode></active-inherit>
+</vrrp-interface>"""
+
+
+def test_children_view_dict_element():
+    r = pygxml.parse(BOOKS).get("store.book.0")
+    children = r.children()
+    assert [k for k, _ in children] == ["title", "author", "price"]
+    assert len(children) == 3
+    assert str(list(children)[0][1]) == "XML in a Nutshell"
+
+
+def test_children_view_keeps_duplicate_names():
+    r = pygxml.parse(BOOKS).get("store")
+    pairs = list(r.children())
+    assert [k for k, _ in pairs] == ["book", "book", "book", "magazine"]
+    assert [str(v.get("@id")) for _, v in pairs] == ["b1", "b2", "b3", "m1"]
+
+
+def test_children_view_preserves_interleaving():
+    r = pygxml.parse(INTERLEAVED)
+    pairs = list(r.children())
+    assert [k for k, _ in pairs] == [
+        "vrrp-vlan",
+        "interface-state",
+        "vrrp-mode",
+        "vrrp-vlan",
+        "interface-state",
+        "active-inherit",
+    ]
+    assert str(pairs[0][1].get("unit")) == "1"
+    assert str(pairs[3][1].get("unit")) == "2"
+    assert str(pairs[5][1].get("vrrp-mode")) == "inherit"
+
+
+def test_children_view_each_value_is_single_element():
+    r = pygxml.parse(BOOKS).get("store")
+    for _, value in r.children():
+        assert isinstance(value, pygxml.Result)
+        assert len(value) == 1
+
+
+def test_children_view_keeps_namespace_prefix():
+    atom = b"""<?xml version="1.0"?>
+<atom:feed xmlns:atom="http://www.w3.org/2005/Atom">
+  <atom:title>Example Feed</atom:title>
+  <atom:entry><atom:title>First Post</atom:title></atom:entry>
+</atom:feed>"""
+    names = [k for k, _ in pygxml.parse(atom).children()]
+    assert names == ["atom:title", "atom:entry"]
+
+
+def test_children_view_ignores_non_element_nodes():
+    doc = b"""<root>
+  text before
+  <!-- a comment -->
+  <a>1</a>
+  <![CDATA[raw]]>
+  <?pi target?>
+  <b>2</b>
+</root>"""
+    assert [k for k, _ in pygxml.parse(doc).children()] == ["a", "b"]
+
+
+def test_children_view_repeated_iteration():
+    r = pygxml.parse(BOOKS).get("store.book.0")
+    children = r.children()
+    first = [k for k, _ in children]
+    second = [k for k, _ in children]
+    assert first == second == ["title", "author", "price"]
+
+
+def test_children_on_non_dict_raises_typeerror():
+    with pytest.raises(TypeError):
+        pygxml.parse(BOOKS).get("store.book.0.title").children()
+    with pytest.raises(TypeError):
+        pygxml.parse(BOOKS).get("store.book.#.title").children()
+    with pytest.raises(TypeError):
+        pygxml.parse(BOOKS).get("store.zzz").children()
+
+
 def test_keys_values_items_on_non_dict_raise_typeerror():
     text_r = pygxml.parse(BOOKS).get("store.book.0.title")
     with pytest.raises(TypeError):

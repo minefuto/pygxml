@@ -46,6 +46,12 @@ book.get("title").to_str()                                # 'XML in a Nutshell'
 book.get("@id").to_str()                                  # 'b1'
 book.get("price").to_int()                                # 30
 
+# Result.children() — walk direct child elements in document order,
+# keeping duplicate tag names.
+store = pygxml.get(xml, "store")
+[name for name, _ in store.children()]                    # ['book', 'book', 'book']
+[c.get("title").to_str() for _, c in store.children()]    # ['XML in a Nutshell', ...]
+
 # parse(data) — wrap the input as a top-level Result for chained navigation.
 r = pygxml.parse(xml)
 r.get("store.book.0.title").to_str()                      # 'XML in a Nutshell'
@@ -142,7 +148,14 @@ children, so `.get(...)` against them yields an empty Result.
 | `v.keys()`          | Lazy `KeysView` of dict keys (raises `TypeError` for non-dict)            |
 | `v.values()`        | Lazy `ValuesView` of dict values (raises `TypeError` for non-dict)        |
 | `v.items()`         | Lazy `ItemsView` of `(key, Result)` pairs (raises `TypeError` for non-dict) |
+| `v.children()`      | Lazy `ChildrenView` of `(name, Result)` pairs for every direct child element, in document order (raises `TypeError` for non-dict) |
 | `r == "x"`, `r == ["a", "b"]`, `r == other_result` | Equality with str/list/Result |
+
+`Result.items()` groups same-named siblings under a single key, so the order
+between differently named siblings is lost. `Result.children()` yields one
+pair per direct child element instead: duplicate names are kept and document
+order is preserved. Names are raw QNames (namespace prefix included), and
+text, comments, CDATA and processing instructions are not yielded.
 
 
 ### Path
